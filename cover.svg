@@ -8,5 +8,5 @@
   <circle cx="500" cy="348" r="26" fill="#3A1D78"/>
   <text x="500" y="358" text-anchor="middle" font-family="Barlow Semi Condensed" font-weight="700" font-size="30" fill="#FFFFFF">A</text>
   <text x="48" y="790" font-family="Barlow Semi Condensed" font-weight="700" font-size="96" fill="#F4EFFF">GOG</text>
-  <text x="48" y="860" font-family="Barlow Semi Condensed" font-weight="400" font-size="64" fill="#C9BBEC">Installer</text>
+  <text x="48" y="860" font-family="Barlow Semi Condensed" font-weight="400" font-size="64" fill="#C9BBEC">Backup Installer</text>
 </svg>

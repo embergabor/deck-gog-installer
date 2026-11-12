@@ -1,5 +1,5 @@
 #!/bin/bash
-# Copy GOG Installer to a Steam Deck over SSH. Doesn't touch Steam; the app adds itself on request.
+# Copy GOG Backup Installer to a Steam Deck over SSH. Doesn't touch Steam; the app adds itself on request.
 # Usage: ./install.sh [user@host]      (default deck@steamdeck.local)
 # Env:   SSH_KEY=path/to/key           (default ~/.ssh/id_deck_wavesafe if it exists)
 set -euo pipefail
