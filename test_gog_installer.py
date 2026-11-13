@@ -455,6 +455,13 @@ class Sources(unittest.TestCase):
         cfg = {"sources": [{"type": "usb", "uuid": "u", "label": "L", "folder": "gog"}]}
         self.assertEqual(g.migrate_config(cfg), cfg)
 
+    def test_default_proton_is_kept(self):
+        cfg = {"sources": [], "proton": "proton_9"}
+        self.assertEqual(g.migrate_config(cfg), cfg)
+        self.assertNotIn("proton", g.migrate_config({"sources": [], "proton": ""}))
+        self.assertEqual(g.migrate_config({"source": "smb", "smb_server": "s", "proton": "proton_9"})["proton"],
+                         "proton_9")
+
     def test_drives_are_removable_partitions_only(self):
         drives = g.parse_drives(LSBLK)
         self.assertEqual([d["dev"] for d in drives], ["/dev/sda1", "/dev/mmcblk0p1"])
@@ -480,6 +487,7 @@ class Sources(unittest.TestCase):
     def test_same_build_prefers_usb_whatever_the_order(self):
         merged = g.merge_games([(self.SMB, [self.game("Hollow Knight", self.HK)]), (self.USB, [self.game("HK copy", self.HK)])])
         self.assertEqual([(x["source"], x["folder"], x["slug"]) for x in merged], [("USB", "HK copy", "hollow_knight")])
+        self.assertEqual(merged[0]["where"], "L")  # the drive's name, shown on the game's page
 
     def test_newest_build_wins_over_usb(self):
         merged = g.merge_games([(self.USB, [self.game("HK", "setup_hollow_knight_1.5.9999.exe")]),
@@ -739,6 +747,110 @@ class DDrawCompat(unittest.TestCase):
         with open(self.exe, "wb") as f:
             f.write(b"MZ not a pe" + b"\0" * 64)
         self.assertIsNone(g.ddrawcompat_state(self.exe))
+
+
+class Library(unittest.TestCase):
+    """What the cover grid shows and where its covers come from."""
+
+    def game(self, slug, title, **kw):
+        return dict({"slug": slug, "id": slug, "title": title, "size": 1}, **kw)
+
+    def test_installed_games_show_without_a_source(self):
+        games = [self.game("b", "Beta"), self.game("a", "Alpha")]
+        state = {"games": {"a": {"title": "Alpha (installed)"}, "z": {"title": "Zeta"}}}
+        entries = g.library_entries(games, state)
+        self.assertEqual([e["title"] for e in entries], ["Alpha (installed)", "Beta", "Zeta"])
+        self.assertIsNone(entries[2]["game"])            # Zeta: installed, but on no source right now
+        self.assertEqual(entries[0]["game"]["slug"], "a")
+
+    def test_tabs(self):
+        self.assertTrue(g.in_tab("down", "all"))
+        self.assertTrue(g.in_tab("warn", "not"))
+        self.assertFalse(g.in_tab("play", "not"))
+        self.assertTrue(g.in_tab("check", "inst"))
+        self.assertFalse(g.in_tab("down", "inst"))
+
+    def test_play_url_is_the_shortcut(self):
+        appid = g.shortcut_appid("hollow_knight")[0]
+        self.assertEqual(g.play_url("hollow_knight"), f"steam://rungameid/{(appid << 32) | 0x02000000}")
+
+    def test_cover_urls_steam_first(self):
+        self.assertEqual(g.cover_urls({"steam_appid": 367520, "cover_vertical": "https://x/c.jpg"}),
+                         [f"{g.STEAM_CDN}/367520/library_600x900_2x.jpg", "https://x/c.jpg"])
+        self.assertEqual(g.cover_urls({"steam_appid": 0}), [])
+
+    def test_cover_files_prefer_steam_grid(self):
+        with tempfile.TemporaryDirectory() as d:
+            appid = g.shortcut_appid("hk")[0]
+            grid = f"{d}/steam/userdata/42/config/grid"
+            os.makedirs(grid)
+            os.makedirs(f"{d}/covers")
+            for path in (f"{grid}/{appid}p.png", f"{d}/covers/hk.jpg", f"{d}/covers/hk.jpg.tmp"):
+                open(path, "wb").close()
+            with mock.patch.object(g, "STEAM", f"{d}/steam"), mock.patch.object(g, "COVERS", f"{d}/covers"):
+                self.assertEqual(g.cover_files("hk", True), [f"{grid}/{appid}p.png", f"{d}/covers/hk.jpg"])
+                self.assertEqual(g.cover_files("hk", False), [f"{d}/covers/hk.jpg"])
+
+    def test_download_cover_skips_what_isnt_an_image(self):
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(g, "COVERS", d), \
+                mock.patch.object(g, "http_get", side_effect=[b"<html>", b"\xff\xd8\xff jpeg"]):
+            path = g.download_cover("hk", {"steam_appid": 1, "cover_vertical": "https://x/c.jpg"})
+            self.assertEqual(path, f"{d}/hk.jpg")
+            with open(path, "rb") as f:
+                self.assertEqual(f.read(), b"\xff\xd8\xff jpeg")
+
+    def test_thumbnail_made_once(self):
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(g, "COVERS", d):
+            src = f"{d}/hk.png"
+            with open(src, "wb") as f:
+                f.write(b"\x89PNG\r\n\x1a\n data")
+
+            def convert(cmd, input, **kw):
+                self.assertIn(b'preserveAspectRatio="xMidYMid slice"', input)
+                self.assertIn(b"data:image/png;base64,", input)
+                open(cmd[-1], "wb").close()
+                return mock.Mock(returncode=0)
+            with mock.patch.object(g.subprocess, "run", side_effect=convert) as run:
+                first = g.cover_thumbnail(src, 168, 252)
+                self.assertEqual(g.cover_thumbnail(src, 168, 252), first)
+            self.assertEqual(run.call_count, 1)
+            self.assertTrue(first.endswith("-168x252.png") and os.path.exists(first))
+
+    def test_thumbnail_of_a_broken_file(self):
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(g, "COVERS", d):
+            with open(f"{d}/x.jpg", "wb") as f:
+                f.write(b"not an image")
+            self.assertIsNone(g.cover_thumbnail(f"{d}/x.jpg", 10, 15))
+
+    def test_likely_exe_is_the_biggest(self):
+        with tempfile.TemporaryDirectory() as d:
+            for name, size in (("editor.exe", 10), ("game.exe", 300), ("launcher.exe", 50)):
+                with open(f"{d}/{name}", "wb") as f:
+                    f.write(b"x" * size)
+            self.assertEqual(g.likely_exe([f"{d}/editor.exe", f"{d}/game.exe", f"{d}/launcher.exe"]), 1)
+        self.assertEqual(g.likely_exe([]), 0)
+
+    def test_tail_lines(self):
+        with tempfile.TemporaryDirectory() as d:
+            with open(f"{d}/log", "w") as f:
+                f.write("one\n\ntwo\r\nthree\n")
+            self.assertEqual(g.tail_lines(f"{d}/log", 2), ["two", "three"])
+        self.assertEqual(g.tail_lines("/nonexistent/log", 2), [])
+
+    def test_elapsed(self):
+        self.assertEqual(g.fmt_elapsed(252), "4:12")
+        self.assertEqual(g.fmt_elapsed(3725), "1:02:05")
+
+    def test_new_installs_get_the_default_proton(self):
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(g, "save_state"):
+            state = {"games": {}}
+            task = {"exe": f"{d}/game.exe", "workdir": d}
+            g.record_install(state, {"slug": "a", "title": "A"}, task, "proton_9")
+            g.record_install(state, {"slug": "b", "title": "B"}, task, g.COMPAT_TOOL[1])
+            g.record_install(state, {"slug": "c", "title": "C"}, task)
+        self.assertEqual(state["games"]["a"]["proton"], "proton_9")
+        self.assertNotIn("proton", state["games"]["b"])   # the default anyway: nothing to write
+        self.assertNotIn("proton", state["games"]["c"])
 
 
 if __name__ == "__main__":

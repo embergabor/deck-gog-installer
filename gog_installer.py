@@ -55,13 +55,18 @@ SOURCE_TYPES = ("smb", "usb")
 
 
 def migrate_config(cfg):
-    """Older versions kept one SMB source in flat keys, and had SSH sources; now a list of SMB and USB sources."""
+    """Older versions kept one SMB source in flat keys, and had SSH sources; now a list of SMB and USB sources,
+    plus "proton", the Proton version new installs get in Steam (missing: Proton Experimental)."""
     if isinstance(cfg.get("sources"), list):
-        return {"sources": [src for src in cfg["sources"] if src.get("type") in SOURCE_TYPES]}
-    if cfg.get("source") == "smb":
-        return {"sources": [{"type": "smb", "server": cfg.get("smb_server", ""), "share": cfg.get("smb_share", ""),
-                             "folder": cfg.get("smb_folder", "")}]}
-    return {"sources": []}
+        out = {"sources": [src for src in cfg["sources"] if src.get("type") in SOURCE_TYPES]}
+    elif cfg.get("source") == "smb":
+        out = {"sources": [{"type": "smb", "server": cfg.get("smb_server", ""), "share": cfg.get("smb_share", ""),
+                            "folder": cfg.get("smb_folder", "")}]}
+    else:
+        out = {"sources": []}
+    if isinstance(cfg.get("proton"), str) and cfg["proton"]:
+        out["proton"] = cfg["proton"]
+    return out
 
 
 def load_config():
@@ -489,7 +494,8 @@ def merge_games(per_source, installed=()):
                                                      -SOURCE_PREFERENCE.get(e[1].get("type"), 9), -e[0]))
         folders = {g["folder"] for _, _, g in group}
         slug = installed_slug(best, folders, installed) or best["id"]
-        out.append(dict(best, slug=slug, source=source_label(src)[0]))
+        kind, where, _ = source_label(src)
+        out.append(dict(best, slug=slug, source=kind, where=where))
     return sorted(out, key=lambda g: g["title"].lower())
 
 
@@ -1019,8 +1025,9 @@ class InstallJob(threading.Thread):
                 pass
 
 
-def record_install(state, game, task):
-    """Remember what Steam should launch; called once the executable is known."""
+def record_install(state, game, task, proton=None):
+    """Remember what Steam should launch; called once the executable is known. proton: the version
+    chosen for new installs in Settings, if any."""
     root = task.get("root") or os.path.dirname(task["exe"])
     icons = glob.glob(f"{glob.escape(root)}/goggame-*.ico")
     entry = {
@@ -1032,6 +1039,8 @@ def record_install(state, game, task):
     for k in LOOKUP_KEYS[1:]:
         if game.get(k) is not None:
             entry[k] = game[k]
+    if proton and proton != COMPAT_TOOL[1]:
+        entry["proton"] = proton
     state["games"][game["slug"]] = entry
     save_state(state)
 
@@ -1561,10 +1570,12 @@ def protondb_rating(appid):
     return hit if hit.get("tier") else None
 
 
-def start_protondb_update():
-    """Refresh suggestions in the background at low priority; it's quick to skip when fresh."""
-    subprocess.Popen(["nice", "-n", "19", sys.executable, os.path.abspath(__file__), "--update-protondb"],
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+def start_protondb_update(force=False):
+    """Refresh suggestions in the background at low priority; it's quick to skip when fresh.
+    Returns the process, so Settings can tell when a refresh asked for there is done."""
+    return subprocess.Popen(["nice", "-n", "19", sys.executable, os.path.abspath(__file__), "--update-protondb"]
+                            + (["--force"] if force else []),
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
 
 
 def valve_tool_name(folder):
@@ -1833,10 +1844,12 @@ def start_apply_steam():
 # --- gamepad -----------------------------------------------------------------------------
 
 class Gamepad:
-    """Reads every gamepad through evdev and turns it into actions: up, down, a, b, x, y, menu.
-    Steam's virtual pad and the real one can both report a press, so held state is shared."""
+    """Reads every gamepad through evdev and turns it into actions: up, down, left, right, a, b, x, y,
+    l1, r1, menu (Start) and view (Select). Steam's virtual pad and the real one can both report a press,
+    so held state is shared."""
 
     REPEAT_DELAY, REPEAT_EVERY = 0.35, 0.09
+    DIRECTIONS = ("up", "down", "left", "right")
 
     def __init__(self):
         self.devices, self.held, self.next_repeat, self.axis = [], {}, {}, {}
@@ -1879,23 +1892,25 @@ class Gamepad:
                 src = dev.path
                 if ev.type == e.EV_KEY:
                     action = {e.BTN_SOUTH: "a", e.BTN_EAST: "b", 307: "x", 308: "y",  # 307/308: BTN_X/BTN_Y
-                              e.BTN_START: "menu",
-                              e.BTN_DPAD_UP: "up", e.BTN_DPAD_DOWN: "down"}.get(ev.code)
+                              e.BTN_TL: "l1", e.BTN_TR: "r1", e.BTN_START: "menu", e.BTN_SELECT: "view",
+                              e.BTN_DPAD_UP: "up", e.BTN_DPAD_DOWN: "down",
+                              e.BTN_DPAD_LEFT: "left", e.BTN_DPAD_RIGHT: "right"}.get(ev.code)
                     if action and ev.value in (0, 1):
                         self._set(action, src, ev.value == 1, out)
-                elif ev.type == e.EV_ABS and ev.code in (e.ABS_HAT0Y, e.ABS_Y):
-                    if ev.code == e.ABS_HAT0Y:
+                elif ev.type == e.EV_ABS and ev.code in (e.ABS_HAT0X, e.ABS_HAT0Y, e.ABS_X, e.ABS_Y):
+                    if ev.code in (e.ABS_HAT0X, e.ABS_HAT0Y):
                         val = ev.value
                     else:
-                        info = dev.absinfo(e.ABS_Y)
+                        info = dev.absinfo(ev.code)
                         span = max(1, info.max - info.min)
                         norm = (ev.value - info.min) / span * 2 - 1
                         val = -1 if norm < -0.6 else 1 if norm > 0.6 else 0
+                    neg, pos = ("up", "down") if ev.code in (e.ABS_HAT0Y, e.ABS_Y) else ("left", "right")
                     source = (src, ev.code)
-                    self._set("up", source, val < 0, out)
-                    self._set("down", source, val > 0, out)
+                    self._set(neg, source, val < 0, out)
+                    self._set(pos, source, val > 0, out)
         now = time.monotonic()
-        for action in ("up", "down"):
+        for action in self.DIRECTIONS:
             if self.held.get(action) and now >= self.next_repeat.get(action, 0):
                 out.append(action)
                 self.next_repeat[action] = now + self.REPEAT_EVERY
@@ -1903,14 +1918,155 @@ class Gamepad:
 
 
 # --- UI ----------------------------------------------------------------------------------
+# One Tk canvas, laid out at 1280x800 and scaled to the screen. The gamepad comes first; every control can
+# also be tapped. The library is a grid of covers. Tk can't read JPEG or scale images, so covers become PNG
+# thumbnails through rsvg-convert, cached in ~/.cache/gog-installer/covers.
 
 GROUND, BAND, LINE, ROW_LINE = "#1C0F36", "#2A1650", "#4A2F7F", "#33205C"
 TEXT, MUTED, DIM, FOCUS, CHIP, WARN, WARN_ON_FOCUS = (
     "#F4EFFF", "#C9BBEC", "#A08DCB", "#E4D8FF", "#3A1D78", "#FFC56B", "#6B3D00")
-VISIBLE_ROWS = 7
+SCRIM = "#100820"
+TINTS = ("#3D2A6B", "#24406A", "#5A2F4C", "#2F5248", "#5C4524", "#3A3F70", "#4E2B2B", "#22505C",
+         "#4A3C66", "#36503A", "#5B3A5E", "#2C3A55")  # a game's placeholder cover until its art is there
+COVERS = f"{CACHE}/covers"
+TABS = (("all", "All"), ("not", "Not installed"), ("inst", "Installed"))
+FOOT = 724  # top of the footer band
+INSTALLED = ("play", "check")  # cover badges: play = in Steam, check = installed, down = not installed, warn = no space
+
+
+def tint(slug):
+    return TINTS[binascii.crc32(slug.encode()) % len(TINTS)]
+
+
+def play_url(slug):
+    """Steam's run URL for one of our shortcuts: the shortcut's app id in the top 32 bits."""
+    return f"steam://rungameid/{(shortcut_appid(slug)[0] << 32) | 0x02000000}"
+
+
+def launch_game(slug):
+    """Start a game through Steam, so Steam Input, the overlay and playtime work as for any other game."""
+    subprocess.Popen(["steam", play_url(slug)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     start_new_session=True)
+
+
+def library_entries(games, state):
+    """[{"slug", "title", "game"}] sorted by title: the games on the sources, plus installed games that no
+    source holds right now (game is None for those), so they can still be opened and played."""
+    found = {g["slug"] for g in games}
+    out = [{"slug": g["slug"], "title": state["games"].get(g["slug"], {}).get("title") or g["title"], "game": g}
+           for g in games]
+    out += [{"slug": s, "title": g.get("title") or s, "game": None}
+            for s, g in state["games"].items() if s not in found]
+    return sorted(out, key=lambda e: e["title"].lower())
+
+
+def in_tab(status, tab):
+    return tab == "all" or (tab == "inst") == (status in INSTALLED)
+
+
+def cover_files(slug, installed):
+    """Portrait art already on the Deck, best first: Steam's grid for an installed game, then a download."""
+    out = []
+    if installed:
+        appid = shortcut_appid(slug)[0]
+        for user in steam_users():
+            out += sorted(glob.glob(f"{glob.escape(STEAM)}/userdata/{user}/config/grid/{appid}p.*"))
+    out += sorted(glob.glob(f"{glob.escape(COVERS)}/{glob.escape(slug)}.*"))
+    return [p for p in out if os.path.isfile(p) and not p.endswith(".tmp")]
+
+
+def cover_urls(g):
+    """Where to download a portrait cover: Steam's library art, then GOG's box art."""
+    urls = []
+    if g.get("steam_appid"):
+        urls.append(f"{STEAM_CDN}/{g['steam_appid']}/{STEAM_ART['p']}")
+    if g.get("cover_vertical"):
+        urls.append(g["cover_vertical"])
+    return urls
+
+
+def download_cover(slug, g):
+    """Save the first cover that downloads as COVERS/<slug>.jpg or .png; None if none does."""
+    for url in cover_urls(g):
+        try:
+            data = http_get(url)
+        except (OSError, ValueError):
+            continue
+        ext = image_ext(data)
+        if ext:
+            os.makedirs(COVERS, exist_ok=True)
+            path = f"{COVERS}/{slug}.{ext}"
+            with open(path + ".tmp", "wb") as f:
+                f.write(data)
+            os.replace(path + ".tmp", path)
+            return path
+    return None
+
+
+def thumbnail_svg(image, ext, w, h):
+    """An SVG that fills w x h with the image, cropped to fit, for rsvg-convert to turn into a PNG."""
+    mime = "image/png" if ext == "png" else "image/jpeg"
+    data = base64.b64encode(image).decode()
+    return (f'<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="{w}" '
+            f'height="{h}"><image width="{w}" height="{h}" preserveAspectRatio="xMidYMid slice" '
+            f'xlink:href="data:{mime};base64,{data}"/></svg>')
+
+
+def cover_thumbnail(path, w, h):
+    """A w x h PNG of a cover, made once per image and size; None if the image can't be read."""
+    st = os.stat(path)
+    key = binascii.crc32(f"{path}:{st.st_mtime_ns}:{st.st_size}".encode())
+    out = f"{COVERS}/thumbs/{key:08x}-{w}x{h}.png"
+    if os.path.exists(out):
+        return out
+    with open(path, "rb") as f:
+        image = f.read()
+    ext = image_ext(image)
+    if not ext:
+        return None
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    r = subprocess.run(["rsvg-convert", "-o", out + ".tmp"], input=thumbnail_svg(image, ext, w, h).encode(),
+                       capture_output=True, timeout=30)
+    if r.returncode != 0:
+        return None
+    os.replace(out + ".tmp", out)
+    return out
+
+
+def likely_exe(exes):
+    """The index of the file most likely to start the game: the biggest one."""
+    sizes = []
+    for path in exes:
+        try:
+            sizes.append(os.path.getsize(path))
+        except OSError:
+            sizes.append(-1)
+    return max(range(len(exes)), key=lambda i: sizes[i]) if exes else 0
+
+
+def tail_lines(path, n):
+    """The last n non-empty lines of a text file, or []."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - 16384))
+            text = f.read().decode("utf-8", "replace")
+    except OSError:
+        return []
+    return [l.rstrip() for l in text.replace("\r", "\n").splitlines() if l.strip()][-n:]
+
+
+def fmt_elapsed(seconds):
+    m, s = divmod(int(seconds), 60)
+    return f"{m // 60}:{m % 60:02d}:{s:02d}" if m >= 60 else f"{m}:{s:02d}"
 
 
 class App:
+    PICK_TITLES = {"pick_share": "Choose a share", "pick_drive": "Choose a drive", "pick_folder": "Choose a folder"}
+    PICK_EMPTY = {"pick_share": "No shares found for guests",
+                  "pick_drive": "No drive found. Plug one in, then press A to look again.",
+                  "pick_folder": "No folders here. Press Y to use this one."}
+
     def __init__(self):
         import tkinter as tk
         from tkinter import font as tkfont
@@ -1930,19 +2086,29 @@ class App:
         families = set(tkfont.families())
         self.family = next((f for f in ("Barlow Semi Condensed", "Noto Sans", "DejaVu Sans") if f in families),
                            "TkDefaultFont")
+        self.mono = next((f for f in ("DejaVu Sans Mono", "Noto Sans Mono", "Liberation Mono") if f in families),
+                         "TkFixedFont")
         self.fonts, self.hits = {}, []
         self.cfg, self.state = load_config(), load_state()
         forget_removed(self.state)
-        self.games, self.selected, self.top = [], 0, 0
+        self.games, self.shown = [], []
         self.screen, self.job, self.current = "connecting", None, None
         self.events = queue.Queue()
-        self.stop_armed_until, self.message = 0, ""
-        self.exes, self.exe_sel, self.exe_top = [], 0, 0
+        self.stop_armed_until, self.message, self.last_draw, self.dirty = 0, "", 0, False
+        self.tab, self.sel, self.top = "all", 0, 0
+        self.detail_slug, self.detail_sel, self.detail_info = None, 0, {}
+        self.exes, self.exe_sizes, self.exe_sel, self.exe_top, self.exe_likely = [], [], 0, 0, 0
         self.marked, self.queue, self.queue_total, self.queue_done, self.failed = set(), [], 0, 0, []
-        self.draft, self.set_sel, self.pick, self.pick_values, self.pick_sel, self.pick_top = None, 0, [], [], 0, 0
+        self.install_started = 0
+        self.draft, self.set_sel, self.set_top = None, 0, 0
+        self.pick, self.pick_values, self.pick_sel, self.pick_top, self.pick_rows = [], [], 0, 0, 7
         self.field, self.browse_path, self.busy, self.edit_idx, self.edit_sel = "", "", "", 0, 0
-        self.source_errors, self.connected = [], []
+        self.source_errors, self.connected, self.source_counts = [], [], {}
         self.game_slug, self.game_sel, self.game_top, self.game_info, self.tools = None, 0, 0, {}, None
+        self.tool_for, self.tool_sel, self.tool_top = None, 0, 0
+        self.protondb_job = None
+        self.images, self.cover_jobs, self.cover_retry, self.cover_queue = {}, set(), set(), queue.Queue()
+        threading.Thread(target=self.cover_worker, daemon=True).start()
         self.pad = Gamepad()
         self.bind_keys()
         self.canvas.bind("<Button-1>", self.on_click)
@@ -1951,91 +2117,272 @@ class App:
         self.root.after(50, self.connect)
         self.root.after(16, self.tick)
 
-    # helpers -------------------------------------------------------------------------
-    def font(self, size, bold=False):
-        key = (size, bold)
+    # drawing helpers -------------------------------------------------------------------
+    # Coordinates are in the 1280x800 layout; these scale them to the screen.
+
+    def font(self, size, bold=False, mono=False):
+        key = (size, bold, mono)
         if key not in self.fonts:
-            self.fonts[key] = self.tkfont.Font(family=self.family, size=-int(size * self.scale),
+            self.fonts[key] = self.tkfont.Font(family=self.mono if mono else self.family, size=-int(size * self.scale),
                                                weight="bold" if bold else "normal")
         return self.fonts[key]
 
-    def text(self, x, y, s, size, fill=TEXT, bold=False, anchor="w"):
+    def text(self, x, y, s, size, fill=TEXT, bold=False, anchor="w", mono=False):
         self.canvas.create_text(x * self.scale, y * self.scale, text=s, fill=fill, anchor=anchor,
-                                font=self.font(size, bold))
+                                font=self.font(size, bold, mono))
 
-    def rect(self, x0, y0, x1, y1, fill):
+    def width_of(self, s, size, bold=False, mono=False):
+        return self.font(size, bold, mono).measure(s) / self.scale
+
+    def rect(self, x0, y0, x1, y1, fill, **kw):
         self.canvas.create_rectangle(x0 * self.scale, y0 * self.scale, x1 * self.scale, y1 * self.scale,
-                                     fill=fill, width=0)
+                                     fill=fill, width=0, **kw)
 
-    def fit(self, s, size, bold, width):
-        f = self.font(size, bold)
+    def rrect(self, x0, y0, x1, y1, r, fill="", outline="", width=0, dash=None):
+        """A rounded rectangle: a smoothed polygon with each corner point doubled."""
+        s = self.scale
+        r = min(r, (x1 - x0) / 2, (y1 - y0) / 2)
+        x0, y0, x1, y1, r = x0 * s, y0 * s, x1 * s, y1 * s, r * s
+        pts = [x0 + r, y0, x0 + r, y0, x1 - r, y0, x1 - r, y0, x1, y0, x1, y0 + r, x1, y0 + r, x1, y1 - r,
+               x1, y1 - r, x1, y1, x1 - r, y1, x1 - r, y1, x0 + r, y1, x0 + r, y1, x0, y1, x0, y1 - r,
+               x0, y1 - r, x0, y0 + r, x0, y0 + r, x0, y0]
+        kw = {"dash": dash} if dash else {}
+        self.canvas.create_polygon(pts, smooth=True, fill=fill, outline=outline, width=width * s, **kw)
+
+    def circle(self, cx, cy, r, fill="", outline="", width=0):
+        s = self.scale
+        self.canvas.create_oval((cx - r) * s, (cy - r) * s, (cx + r) * s, (cy + r) * s, fill=fill, outline=outline,
+                                width=width * s)
+
+    def fit(self, s, size, bold, width, mono=False):
+        f = self.font(size, bold, mono)
         if f.measure(s) <= width * self.scale:
             return s
         while s and f.measure(s + "…") > width * self.scale:
             s = s[:-1]
         return s.rstrip() + "…"
 
-    def glyph(self, cx, cy, letter, size, fill, solid=False, letter_fill=None):
-        r = size / 2 * self.scale
-        x, y = cx * self.scale, cy * self.scale
-        self.canvas.create_oval(x - r, y - r, x + r, y + r, outline=fill, width=2 * self.scale,
-                                fill=fill if solid else "")
-        self.text(cx, cy, letter, size * 0.56, letter_fill or fill, True, "center")
+    def wrap(self, s, size, bold, width, lines):
+        """Up to `lines` lines of s, each at most width wide; the last is cut with … if it doesn't fit."""
+        out, line = [], ""
+        for word in s.split():
+            joined = f"{line} {word}".strip()
+            if line and self.width_of(joined, size, bold) > width:
+                out.append(line)
+                line = word
+            else:
+                line = joined
+        out.append(line)
+        if len(out) > lines:
+            out = out[:lines - 1] + [self.fit(" ".join(out[lines - 1:]), size, bold, width)]
+        return out
 
-    def legend(self, items, y=762):
-        """Footer hints, right aligned: [(letter, label, enabled, callback)]."""
-        x = 1240
-        for letter, label, enabled, cb in reversed(items):
-            color = TEXT if enabled else DIM
-            width = self.font(24).measure(label) / self.scale
-            self.text(x, y, label, 24, color, False, "e")
-            cx = x - width - 30
-            self.glyph(cx, y, letter, 36, color)
-            if enabled and cb:
-                self.hits.append((cx - 24, y - 30, x, y + 30, cb))
-            x = cx - 18 - 40
+    def icon(self, kind, cx, cy, size, color, weight=None):
+        """Simple line icons, drawn in a box of `size` around (cx, cy)."""
+        s, u = self.scale, size * self.scale
+        w = (weight or max(2.0, size * 0.12)) * s
 
-    def buttons(self, primary, secondary=None):
-        """Large footer buttons on confirm screens."""
-        self.rect(0, 680, 1280, 800, BAND)
-        label, cb = primary
-        w = self.font(32, True).measure(label) / self.scale + 96
-        self.rect(40, 704, 40 + w, 776, FOCUS)
-        self.glyph(77, 740, "A", 42, GROUND, True, FOCUS)
-        self.text(110, 740, label, 32, GROUND, True)
-        self.hits.append((40, 704, 40 + w, 776, cb))
-        if secondary:
-            label2, cb2 = secondary
-            x = 40 + w + 40
-            self.glyph(x + 21, 740, "B", 42, TEXT)
-            self.text(x + 54, 740, label2, 32, TEXT)
-            self.hits.append((x, 704, x + 96 + self.font(32).measure(label2) / self.scale, 776, cb2))
+        def pts(*p):
+            return [cx * s + v * u if i % 2 == 0 else cy * s + v * u for i, v in enumerate(p)]
 
-    def checkbox(self, x, cy, checked, color, mark):
-        s = self.scale
-        x0, y0, size = x * s, (cy - 14) * s, 28 * s
-        self.canvas.create_rectangle(x0, y0, x0 + size, y0 + size, outline=color, width=2 * s,
-                                     fill=color if checked else "")
-        if checked:
-            self.canvas.create_line(x0 + 6 * s, y0 + 15 * s, x0 + 12 * s, y0 + 21 * s, x0 + 22 * s, y0 + 7 * s,
-                                    fill=FOCUS if color == GROUND else GROUND, width=3 * s)
+        def line(*p):
+            self.canvas.create_line(*pts(*p), fill=color, width=w, capstyle="round", joinstyle="round")
 
-    def header(self, right=True):
-        self.rect(0, 0, 1280, 108, BAND)
-        self.text(40, 54, SELF_NAME, 42, TEXT, True)
-        if not right:
+        def box(x0, y0, x1, y1):
+            self.canvas.create_rectangle(*pts(x0, y0, x1, y1), outline=color, width=w)
+
+        if kind == "play":
+            self.canvas.create_polygon(*pts(-0.28, -0.38, 0.4, 0, -0.28, 0.38), fill=color, outline=color,
+                                       width=w * 0.5, joinstyle="round")
+        elif kind == "check":
+            line(-0.36, 0.02, -0.1, 0.28, 0.38, -0.28)
+        elif kind == "down":
+            line(0, -0.4, 0, 0.16)
+            line(-0.26, -0.08, 0, 0.18, 0.26, -0.08)
+            line(-0.36, 0.42, 0.36, 0.42)
+        elif kind == "warn":
+            line(0, -0.36, 0, 0.1)
+            self.canvas.create_oval(*pts(-0.07, 0.29, 0.07, 0.43), fill=color, outline=color)
+        elif kind == "menu":
+            for y in (-0.28, 0, 0.28):
+                line(-0.36, y, 0.36, y)
+        elif kind == "view":
+            box(-0.42, -0.42, 0.14, 0.14)
+            box(-0.14, -0.14, 0.42, 0.42)
+        elif kind == "back":
+            line(0.14, -0.36, -0.2, 0, 0.14, 0.36)
+        elif kind == "next":
+            line(-0.14, -0.36, 0.2, 0, -0.14, 0.36)
+        elif kind == "plus":
+            line(0, -0.38, 0, 0.38)
+            line(-0.38, 0, 0.38, 0)
+        elif kind == "server":
+            box(-0.42, -0.36, 0.42, -0.05)
+            box(-0.42, 0.05, 0.42, 0.36)
+            line(-0.26, -0.2, -0.25, -0.2)
+            line(-0.26, 0.2, -0.25, 0.2)
+        elif kind == "usb":
+            box(-0.22, -0.06, 0.22, 0.46)
+            line(-0.13, -0.06, -0.13, -0.44, 0.13, -0.44, 0.13, -0.06)
+        elif kind == "folder":
+            self.canvas.create_polygon(*pts(-0.42, -0.32, -0.12, -0.32, 0, -0.2, 0.42, -0.2, 0.42, 0.34, -0.42, 0.34),
+                                       fill="", outline=color, width=w, joinstyle="round")
+        elif kind == "file":
+            box(-0.36, -0.32, 0.36, 0.34)
+            line(-0.36, -0.12, 0.36, -0.12)
+
+    def glyph(self, cx, cy, label, size, color, solid=False, ink=None):
+        """A gamepad button: A, B, X, Y in a circle, L1 and R1 in a pill, Start and Select as icons."""
+        r = size / 2
+        if label in ("L1", "R1"):
+            self.rrect(cx - r, cy - r * 0.72, cx + r, cy + r * 0.72, 7, outline=color, width=2)
+            self.text(cx, cy, label, size * 0.42, color, True, "center")
             return
+        self.circle(cx, cy, r - 1, fill=color if solid else "", outline=color, width=2)
+        ink = ink or (GROUND if solid else color)
+        if label in ("menu", "view"):
+            self.icon(label, cx, cy, size * 0.48, ink, 2.4)
+        else:
+            self.text(cx, cy, label, size * 0.52, ink, True, "center")
+
+    def hints(self, items, y=762):
+        """The footer: button hints, right aligned, each tappable. Items: (button, label, enabled, callback[, color])."""
+        self.rect(0, FOOT, 1280, 800, BAND)
+        x = 1240
+        for item in reversed([i for i in items if i]):
+            button, label, enabled, cb = item[:4]
+            color = (item[4] if len(item) > 4 else TEXT) if enabled else DIM
+            w = self.width_of(label, 22)
+            self.text(x, y, label, 22, color, False, "e")
+            gx = x - w - 25
+            self.glyph(gx, y, button, 30, color)
+            if enabled and cb:
+                self.hits.append((gx - 21, y - 30, x + 6, y + 30, cb))
+            x = gx - 15 - 34
+
+    def button(self, x, y, label, button, cb, primary=False, focused=False, enabled=True, h=68, size=28):
+        """A big button with its gamepad button in it; returns its right edge."""
+        g = h * 0.53
+        w = 18 + g + 14 + self.width_of(label, size, True) + 30
+        if primary and enabled:
+            self.rrect(x, y, x + w, y + h, 10, fill=FOCUS)
+            ink = GROUND
+        else:
+            self.rrect(x, y, x + w, y + h, 10, outline=FOCUS if focused else LINE, width=2)
+            ink = TEXT if enabled else DIM
+        if focused:
+            self.rrect(x - 8, y - 8, x + w + 8, y + h + 8, 14, outline=FOCUS, width=4)
+        self.glyph(x + 18 + g / 2, y + h / 2, button, g, ink)
+        self.text(x + 18 + g + 14, y + h / 2, label, size, ink, True)
+        if enabled and cb:
+            self.hits.append((x, y, x + w, y + h, cb))
+        return x + w
+
+    def top_bar(self, back=None, title=None, free=True):
+        """The header band: a back button (also for touch) or the app's name, a title, and free space."""
+        self.rect(0, 0, 1280, 88, BAND)
+        x = 40
+        if back:
+            label, cb = back
+            self.icon("back", 50, 44, 28, TEXT, 2.5)
+            self.text(66, 44, label, 22, TEXT, True)
+            x = 66 + self.width_of(label, 22, True) + 14
+            self.hits.append((28, 16, x, 72, cb))
+            if title:
+                self.rect(x + 6, 28, x + 8, 60, LINE)
+                x += 28
+        if title:
+            self.text(x, 44, title, 28, TEXT, True)
+            x += self.width_of(title, 28, True)
+        if free:
+            self.free_meter()
+        return x
+
+    def free_meter(self):
         free, total = free_space()
-        self.text(1240, 38, f"{fmt_free(free)} free", 26, TEXT, True, "e")
-        self.rect(1000, 66, 1240, 74, LINE)
-        self.rect(1000, 66, 1000 + 240 * (1 - free / total), 74, MUTED)
+        self.text(1240, 30, f"{fmt_free(free)} free", 20, TEXT, True, "e")
+        self.rrect(1040, 52, 1240, 58, 3, fill=LINE)
+        used = 200 * (1 - free / total) if total else 0
+        if used > 6:
+            self.rrect(1040, 52, 1040 + used, 58, 3, fill=MUTED)
+
+    def chip(self, x, cy, label, icon, fill, ink, size=19):
+        """A rounded status label with an icon; returns its right edge."""
+        w = 10 + 18 + 8 + self.width_of(label, size, True) + 14
+        self.rrect(x, cy - 18, x + w, cy + 18, 18, fill=fill)
+        self.icon(icon, x + 19, cy, 16, ink, 2.4)
+        self.text(x + 36, cy, label, size, ink, True)
+        return x + w
+
+    def badge(self, cx, cy, d, status):
+        fill, ink, ring, icon = {"play": (FOCUS, GROUND, "", "play"), "check": (CHIP, TEXT, FOCUS, "check"),
+                                 "down": (GROUND, MUTED, "", "down"), "warn": (WARN, GROUND, "", "warn"),
+                                 "fail": (WARN, GROUND, "", "warn")}[status]
+        self.circle(cx, cy, d / 2, fill=fill, outline=ring, width=2 if ring else 0)
+        self.icon(icon, cx, cy, d * 0.52, ink, max(2.0, d * 0.08))
+
+    def cover(self, x, y, w, h, slug, game, title, status=None, marked=False, focused=False):
+        """A game's portrait cover, or a tinted tile with its title until the art is there."""
+        k = w / 168
+        if focused:
+            self.rrect(x - 8, y - 8, x + w + 8, y + h + 8, 12, outline=FOCUS, width=4)
+        img = self.cover_image(slug, game, w, h)
+        if img:
+            self.canvas.create_image(x * self.scale, y * self.scale, image=img, anchor="nw")
+        else:
+            self.rrect(x, y, x + w, y + h, 6, fill=tint(slug))
+            size = max(14, round(22 * k ** 0.85))
+            pad = 14 * k ** 0.7
+            lines = self.wrap(title, size, True, w - 2 * pad, 4)
+            step = size * 1.08
+            top = y + h - pad - step * len(lines)
+            for i, line in enumerate(lines):
+                self.text(x + pad, top + step * (i + 0.5), line, size, TEXT, True)
+        d = min(44, max(26, 34 * k))
+        if status:
+            self.badge(x + w - 10 - d / 2, y + 10 + d / 2, d, status)
+        if marked:
+            m = min(30, 30 * k)
+            self.rrect(x + 10, y + 10, x + 10 + m, y + 10 + m, 6, fill=FOCUS)
+            self.icon("check", x + 10 + m / 2, y + 10 + m / 2, m * 0.7, GROUND, 3)
+
+    def panel(self, x0, y0, x1, y1):
+        self.rrect(x0, y0, x1, y1, 12, fill=BAND)
+
+    def checkbox(self, x, cy, checked, color, ink):
+        self.rrect(x, cy - 13, x + 26, cy + 13, 5, fill=color if checked else "", outline=color, width=2)
+        if checked:
+            self.icon("check", x + 13, cy, 18, ink, 3)
+
+    # covers ---------------------------------------------------------------------------
+    def cover_image(self, slug, game, w, h):
+        """The cover as a Tk image of w x h, or None while it loads or if there is none."""
+        size = (max(1, round(w * self.scale)), max(1, round(h * self.scale)))
+        key = (slug, size)
+        img = self.images.get(key)
+        if img is None and key not in self.cover_jobs:
+            self.cover_jobs.add(key)
+            self.cover_queue.put((slug, slug in self.state["games"], dict(game or {}), size))
+        return img or None
+
+    def cover_worker(self):
+        """Finds or downloads covers and makes thumbnails, one at a time, behind the UI."""
+        while True:
+            slug, installed, game, (w, h) = self.cover_queue.get()
+            try:
+                files = cover_files(slug, installed)
+                source = files[0] if files else download_cover(slug, game)
+                path = cover_thumbnail(source, w, h) if source else None
+            except (OSError, subprocess.SubprocessError, ValueError):
+                path = None
+            self.events.put(("cover", slug, (w, h), path))
 
     # data ----------------------------------------------------------------------------
     def connect(self):
         sources = list(self.cfg["sources"])
 
         def work():
-            found, errors, connected = [], [], []
+            found, errors, connected, counts = [], [], [], {}
             for src in sources:
                 root, err = connect_source(src)
                 if err:
@@ -2049,8 +2396,9 @@ class App:
                     continue
                 for g in games:
                     g["root"] = root
+                counts[source_mount_dir(src)] = len(games)
                 found.append((src, games))
-            self.events.put(("games", merge_games(found, dict(self.state["games"])), errors, connected))
+            self.events.put(("games", merge_games(found, dict(self.state["games"])), errors, connected, counts))
         threading.Thread(target=work, daemon=True).start()
 
     def disconnect_all(self):
@@ -2059,7 +2407,7 @@ class App:
         self.connected = []
 
     def lookup_sizes(self, games):
-        """Fill in GOG's titles and sizes behind the list; a network failure just leaves sizes blank."""
+        """Fill in GOG's titles, sizes and art behind the grid; a network failure just leaves them blank."""
         cache = load_json(LOOKUP_FILE)
         for g in games:
             if g["setup"] in cache:
@@ -2073,144 +2421,276 @@ class App:
             save_json(LOOKUP_FILE, cache)
             self.events.put(("lookup", g["slug"], info))
 
-    def row_kind(self, g):
-        s = self.state["games"].get(g["slug"])
-        if s:
-            return "added" if s.get("in_steam") else "installed"
-        if g["slug"] in self.marked:
-            return "install"
-        reserved = sum(needed_bytes(x, self.state) for x in self.games if x["slug"] in self.marked)
-        return "install" if needed_bytes(g, self.state) + reserved < free_space()[0] else "nospace"
+    def entries(self):
+        """Every game with its badge: play (in Steam), check (installed), down (can install), warn (no space)."""
+        free = free_space()[0]
+        reserved = sum(needed_bytes(g, self.state) for g in self.games if g["slug"] in self.marked)
+        out = library_entries(self.games, self.state)
+        for e in out:
+            s = self.state["games"].get(e["slug"])
+            if s:
+                e["status"] = "play" if s.get("in_steam") else "check"
+            elif e["slug"] in self.marked or needed_bytes(e["game"], self.state) + reserved < free:
+                e["status"] = "down"
+            else:
+                e["status"] = "warn"
+        return out
 
-    def title_of(self, g):
-        return self.state["games"].get(g["slug"], {}).get("title") or g["title"]
+    def view(self):
+        """The covers on show: the tab's games, or only the installed ones while offline."""
+        tab = "inst" if self.screen == "offline" else self.tab
+        return [e for e in self.entries() if in_tab(e["status"], tab)]
 
     def pending_count(self):
         return len(pending_games(self.state))
+
+    def tool_list(self):
+        if self.tools is None:
+            try:
+                self.tools = installed_proton_tools()
+            except OSError:
+                self.tools = []
+        return self.tools or [COMPAT_TOOL]
+
+    def tool_label(self, name):
+        name = name or COMPAT_TOOL[1]
+        return next((label for label, n in self.tool_list() if n == name), COMPAT_TOOL[0] if name == COMPAT_TOOL[1]
+                    else name)
+
+    def source_status(self, src):
+        """(color, short text) for a source in Settings."""
+        if not is_complete(src):
+            return WARN, "Not set up yet"
+        if src in self.connected:
+            n = self.source_counts.get(source_mount_dir(src), 0)
+            return FOCUS, f"Connected · {n} game{'s' if n != 1 else ''}"
+        if any(s == src for s, _ in self.source_errors):
+            return WARN, "Not reachable"
+        return MUTED, "Connects when you leave Settings"
 
     # drawing -------------------------------------------------------------------------
     def draw(self):
         self.canvas.delete("all")
         self.hits = []
+        self.last_draw, self.dirty = time.monotonic(), False
         getattr(self, "draw_" + self.screen)()
 
-    def draw_connecting(self):
-        self.header(False)
-        self.text(40, 200, "Connecting to your server…", 42, TEXT, True)
+    def grid_geometry(self):
+        """(columns, rows shown, top, cover width, cover height, column gap, row gap)."""
+        if self.screen == "offline":
+            cols, top, gap, row_gap = 9, 290, 20, 24
+        else:
+            cols, top, gap, row_gap = 6, 116, 32, 28
+        w = (1168 - gap * (cols - 1)) / cols
+        return cols, 2, top, w, w * 1.5, gap, row_gap
+
+    def library_header(self, entries):
+        self.rect(0, 0, 1280, 88, BAND)
+        self.text(40, 44, SELF_NAME, 28, TEXT, True)
+        x = 40 + self.width_of(SELF_NAME, 28, True) + 36
+        if self.screen == "offline":
+            label = f"Installed {sum(e['status'] in INSTALLED for e in entries)}"
+            self.text(x, 44, label, 22, TEXT, True)
+            self.rect(x - 6, 70, x + self.width_of(label, 22, True) + 6, 73, FOCUS)
+        else:
+            self.glyph(x + 18, 44, "L1", 36, DIM)
+            self.hits.append((x, 16, x + 36, 72, lambda: self.switch_tab(-1)))
+            x += 36 + 18
+            for tab, name in TABS:
+                label = f"{name} {sum(in_tab(e['status'], tab) for e in entries)}"
+                w = self.width_of(label, 22, True)
+                on = tab == self.tab
+                self.text(x, 44, label, 22, TEXT if on else MUTED, True)
+                if on:
+                    self.rect(x - 6, 70, x + w + 6, 73, FOCUS)
+                self.hits.append((x - 8, 16, x + w + 8, 72, lambda t=tab: self.set_tab(t)))
+                x += w + 26
+            self.glyph(x + 8, 44, "R1", 36, DIM)
+            self.hits.append((x - 10, 16, x + 26, 72, lambda: self.switch_tab(1)))
+            if self.source_errors:
+                k = len(self.source_errors)
+                self.text(1010, 44, f"{k} source{'s' if k > 1 else ''} offline", 18, WARN, True, "e")
+        self.free_meter()
+
+    def draw_grid(self, shown):
+        cols, rows, top, w, h, gap, row_gap = self.grid_geometry()
+        first, last = self.top * cols, min(len(shown), (self.top + rows) * cols)
+        for i in range(first, last):
+            e = shown[i]
+            r, c = divmod(i - first, cols)
+            x, y = 56 + c * (w + gap), top + r * (h + row_gap)
+            game = e["game"] or self.state["games"].get(e["slug"])
+            self.cover(x, y, w, h, e["slug"], game, e["title"], e["status"], e["slug"] in self.marked, i == self.sel)
+            self.hits.append((x, y, x + w, y + h, lambda i=i: self.tap_cover(i)))
+            if e["status"] == "down":
+                self.hits.append((x, y, x + 52, y + 52, lambda i=i: self.toggle_mark(i)))
+        total_rows = -(-len(shown) // cols)
+        if total_rows > rows:
+            track = rows * h + (rows - 1) * row_gap
+            self.rrect(1256, top, 1260, top + track, 2, fill=ROW_LINE)
+            thumb = track * rows / total_rows
+            y = top + (track - thumb) * self.top / max(1, total_rows - rows)
+            self.rrect(1256, y, 1260, y + thumb, 2, fill=DIM)
+
+    def info_line(self, e):
+        """The strip under the grid: what the focused game is and where it stands."""
+        g, s = e["game"], self.state["games"].get(e["slug"], {})
+        if e["status"] == "play":
+            return f"In Steam · {fmt_size(s.get('installed_size', 0))} · {self.tool_label(s.get('proton'))}"
+        if e["status"] == "check":
+            return f"Installed · {fmt_size(s.get('installed_size', 0))} · not in Steam yet"
+        if e["status"] == "warn":
+            reserved = sum(needed_bytes(o, self.state) for o in self.games if o["slug"] in self.marked)
+            left = free_space()[0] - reserved
+            return (f"Needs {fmt_size(needed_bytes(g, self.state))}, {fmt_free(max(0, left))} free"
+                    + (" after the picked games" if reserved else ""))
+        size = install_size(g, self.state)
+        parts = ["Not installed", f"{fmt_size(g['size'])} installer"]
+        if size:
+            parts.append(f"{fmt_size(size)} once installed")
+        parts.append(f"from {g.get('source', '')}")
+        return " · ".join(parts)
 
     def draw_library(self):
-        self.header()
-        cols = {"installer": 840, "needs": 1010}
-        self.text(40, 128, "Game", 18, MUTED, True)
-        self.text(cols["installer"], 128, "Installer", 18, MUTED, True, "e")
-        self.text(cols["needs"], 128, "Install size", 18, MUTED, True, "e")
-        self.rect(0, 147, 1280, 149, LINE)
-        n = len(self.games)
-        if self.source_errors:
-            k = len(self.source_errors)
-            self.text(200, 128, f"{k} source{'s' if k > 1 else ''} not connected", 18, WARN, True)
-        if n > VISIBLE_ROWS:
-            self.text(1240, 128, f"{self.selected + 1} of {n}", 18, MUTED, True, "e")
-        if not n:
-            self.text(40, 210, "No installers found", 42, TEXT, True)
-            self.text(40, 262, "Put each game in its own folder, with its setup_*.exe directly inside it.", 28, MUTED)
-        y = 149
-        for i in range(self.top, min(self.top + VISIBLE_ROWS, n)):
-            g, on = self.games[i], i == self.selected
-            h = 96 if on else 78
-            kind = self.row_kind(g)
-            if on:
-                self.rect(0, y, 1280, y + h, FOCUS)
+        entries = self.entries()
+        tab = "inst" if self.screen == "offline" else self.tab
+        shown = self.shown = [e for e in entries if in_tab(e["status"], tab)]
+        self.sel = max(0, min(self.sel, len(shown) - 1))
+        self.library_header(entries)
+        if not shown:
+            if self.screen == "offline":
+                self.text(56, 340, "No games installed yet", 34, TEXT, True)
+            elif not entries:
+                self.text(56, 200, "No installers found", 42, TEXT, True)
+                self.text(56, 252, "Put each game in its own folder, with its setup_*.exe directly inside it.", 26, MUTED)
             else:
-                self.rect(0, y + h - 2, 1280, y + h, ROW_LINE)
-            fg = GROUND if on else TEXT
-            cy = y + h / 2
-            if kind == "install":
-                self.checkbox(40, cy, g["slug"] in self.marked, fg, GROUND if on else GROUND)
-            self.text(84, cy, self.fit(self.title_of(g), 30, True, 560), 30, fg, True)
-            self.text(cols["installer"], cy, fmt_size(g["size"]), 26, fg, False, "e")
-            size = install_size(g, self.state)
-            if size:
-                self.text(cols["needs"], cy, fmt_size(size), 26, fg, False, "e")
-            if on and kind == "install":
-                chip = f"Install {len(self.marked)}" if self.marked else "Install"
-                w = self.font(26, True).measure(chip) / self.scale + 88  # 12 + 36 icon + 18 gap + text + 22
-                self.rect(1240 - w, cy - 28, 1240, cy + 28, CHIP)
-                self.glyph(1240 - w + 30, cy, "A", 36, "#FFFFFF", True, CHIP)
-                self.text(1240 - 22, cy, chip, 26, "#FFFFFF", True, "e")
-            else:
-                status = {"added": "In Steam", "installed": "Installed", "nospace": "Needs more space",
-                          "install": ""}[kind]
-                warn = kind == "nospace"
-                color = (WARN_ON_FOCUS if warn else CHIP) if on else (WARN if warn else MUTED)
-                self.text(1240, cy, status, 24, color, False, "e")
-            self.hits.append((0, y, 1280, y + h, lambda i=i: self.tap_row(i)))
-            if kind == "install":
-                self.hits.append((0, y, 76, y + h, lambda i=i: self.toggle_mark(i)))
-            y += h
-        self.rect(0, 724, 1280, 800, BAND)
-        kind = self.row_kind(self.games[self.selected]) if n else None
-        if self.marked:
-            label, can_a = f"Install {len(self.marked)}", True
-        else:
-            label = {"install": "Install", "nospace": "Not enough space"}.get(kind, "Options" if n else "Install")
-            can_a = kind in ("install", "added", "installed")
-        marked_here = bool(n) and self.games[self.selected]["slug"] in self.marked
+                self.text(56, 200, "Nothing here", 42, TEXT, True)
+                self.text(56, 252, "L1 and R1 switch to the other tabs.", 26, MUTED)
+        self.draw_grid(shown)
+        e = shown[self.sel] if shown else None
+        if e:
+            title = self.fit(e["title"], 26, True, 560)
+            self.text(56, 690, title, 26, TEXT, True)
+            x = 56 + self.width_of(title, 26, True) + 20
+            self.text(x, 690, self.fit(self.info_line(e), 20, False, 1080 - x), 20, MUTED)
+            self.text(1224, 690, f"{self.sel + 1} of {len(shown)}", 20, MUTED, True, "e")
+        marked_here = bool(e) and e["slug"] in self.marked
         count = self.pending_count()
-        self.legend([("A", label, can_a, self.action_a),
-                     ("X", "Unselect" if marked_here else "Select", kind == "install", self.action_x),
-                     ("Y", f"Add to Steam ({count})", count > 0, self.action_y),
-                     ("≡", "Settings", True, self.action_menu),
-                     ("B", "Clear selection" if self.marked else "Quit", True, self.action_b)])
+        offline = self.screen == "offline"
+        self.hints([("A", "Open", bool(e), self.action_a),
+                    None if offline else ("X", "Unselect" if marked_here else "Select",
+                                          bool(e) and e["status"] == "down", self.action_x),
+                    ("menu", "Try again", True, self.action_menu) if offline else
+                    (("menu", f"Install {len(self.marked)} picked", True, self.action_menu) if self.marked else None),
+                    ("Y", f"Add to Steam ({count})", count > 0, self.action_y),
+                    ("view", "Settings", True, self.action_view),
+                    ("B", "Clear picks" if self.marked and not offline else "Quit", True, self.action_b)])
 
-    def draw_installing(self):
-        self.header()
-        progress = f"Installing {self.queue_done + 1} of {self.queue_total}" if self.queue_total > 1 else "Installing"
-        self.text(40, 160, progress, 28, MUTED)
-        self.text(40, 234, self.fit(self.current["title"], 84, True, 1200), 84, TEXT, True)
-        y = 330
-        self.rect(40, y, 1240, y + 2, LINE)
-        self.text(96, y + 44, "Connected to your server", 30, MUTED)
-        self.text(1240, y + 44, "Nothing copied to the Deck", 26, MUTED, False, "e")
-        self.rect(40, y + 84, 1240, y + 86, LINE)
-        self.rect(40, y + 86, 1240, y + 190, FOCUS)
-        self.text(96, y + 138, "Running the GOG installer", 34, GROUND, True)
-        self.text(1216, y + 138, "No input needed", 26, GROUND, False, "e")
-        self.text(96, y + 232, "Find the game and get it ready for Steam", 30, MUTED)
-        self.rect(40, y + 272, 1240, y + 274, LINE)
-        self.rect(0, 724, 1280, 800, BAND)
-        armed = time.monotonic() < self.stop_armed_until
-        self.legend([("B", ("Press B again to stop" if armed else ("Stop installs" if self.queue_total > 1 else "Stop install")), True, self.action_b)])
+    def draw_offline(self):
+        if not self.cfg["sources"]:
+            self.top_bar(title=SELF_NAME)
+            self.text(56, 220, "Add where your installers are", 56, TEXT, True)
+            self.text(56, 280, "An SMB share on your network, or a USB drive or SD card.", 26, MUTED)
+            self.button(56, 340, "Open Settings", "view", self.action_view, primary=True, focused=True)
+            self.hints([("view", "Settings", True, self.action_view), ("B", "Quit", True, self.action_b)])
+            return
+        self.draw_library()
+        self.rrect(56, 112, 1224, 256, 12, fill=BAND, outline=WARN, width=2)
+        self.circle(104, 160, 24, fill=WARN)
+        self.icon("warn", 104, 160, 24, GROUND, 3)
+        self.text(148, 146, "Can’t reach your installers", 28, TEXT, True)
+        self.text(148, 180, "Your installed games still work. New installs come back when a source is reachable.",
+                  20, MUTED)
+        x = 148
+        for src, _ in self.source_errors[:3]:
+            label = self.fit(f"{source_label(src)[1]} · not reachable", 18, False, 300)
+            w = self.width_of(label, 18) + 42
+            self.rrect(x, 208, x + w, 240, 16, fill=GROUND)
+            self.circle(x + 16, 224, 4, fill=WARN)
+            self.text(x + 28, 224, label, 18, TEXT)
+            x += w + 10
+        w = 18 + 30 + 12 + self.width_of("Try again", 22, True) + 22
+        self.button(1200 - w, 128, "Try again", "menu", self.action_menu, h=56, size=22)
 
-    def draw_add_to_steam(self):
-        pending = list(pending_games(self.state).values())
-        n = len(pending)
-        updates = sum(1 for g in pending if g.get("in_steam"))
-        verb = "Update" if updates == n else ("Add" if not updates else "Add or update")
-        self.text(40, 100, f"{verb} {n} game{'s' if n != 1 else ''} in Steam?", 72, TEXT, True)
-        y = 164
-        self.rect(40, y, 1240, y + 2, LINE)
-        for g in pending[:3]:
-            self.text(40, y + 44, self.fit(g["title"], 34, True, 1000), 34, TEXT, True)
-            note = "new settings" if g.get("in_steam") else fmt_size(g.get("installed_size", 0))
-            self.text(1240, y + 44, note, 26, MUTED, False, "e")
-            y += 84
-            self.rect(40, y, 1240, y + 2, LINE)
-        if n > 3:
-            self.text(40, y + 30, f"and {n - 3} more", 26, MUTED)
-            y += 50
-        self.text(40, y + 46, "Steam closes and reopens, which takes about 20 seconds. This app closes too.", 32)
-        self.text(40, y + 90, "The games will be in your library when Steam is back.", 32)
-        self.buttons(("Add and restart Steam", self.action_a), ("Not now", self.action_b))
+    def draw_connecting(self):
+        self.top_bar(title=SELF_NAME)
+        cols, rows, top, w, h, gap, row_gap = self.grid_geometry()
+        for i in range(cols * rows):
+            r, c = divmod(i, cols)
+            x, y = 56 + c * (w + gap), top + r * (h + row_gap)
+            self.rrect(x, y, x + w, y + h, 6, fill=BAND)
+        self.text(56, 690, "Connecting to your sources…", 26, TEXT, True)
+        self.hints([("B", "Quit", True, self.action_b)])
+
+    def detail_game(self):
+        return next((g for g in self.games if g["slug"] == self.detail_slug), None)
+
+    def draw_details(self):
+        g = self.detail_game()
+        if not g:
+            self.screen = "library"
+            return self.draw_library()
+        self.top_bar(back=("Library", self.action_b))
+        self.cover(56, 124, 384, 576, g["slug"], g, g["title"])
+        x, right = 496, 1224
+        free = free_space()[0]
+        need = needed_bytes(g, self.state)
+        marked = g["slug"] in self.marked
+        reserved = sum(needed_bytes(o, self.state) for o in self.games if o["slug"] in self.marked)
+        fits = marked or need + reserved < free
+        if fits:
+            end = self.chip(x, 146, "Not installed", "down", ROW_LINE, MUTED)
+        else:
+            end = self.chip(x, 146, "Not enough space", "warn", WARN, GROUND)
+        where = " · ".join(p for p in (f"From {g.get('source', '')}", g.get("where", ""), g.get("folder", "")) if p)
+        self.text(end + 14, 146, self.fit(where, 19, False, right - end - 14), 19, MUTED)
+        y = 176
+        for line in self.wrap(g["title"], 60, True, right - x, 2):
+            self.text(x, y + 30, line, 60, TEXT, True)
+            y += 62
+        self.text(x, y + 16, self.fit(f"Version {g.get('version') or '?'} · {g['setup']}", 21, False, right - x),
+                  21, MUTED)
+        y += 44
+        size = install_size(g, self.state)
+        left = free - reserved - (0 if marked else need)  # picked games have their space set aside already
+        last = ((fmt_free(left), "Free afterwards" if not reserved else "Free after the picked games") if fits
+                else (fmt_size(-left), "More space needed"))
+        stats = [(fmt_size(g["size"]), "Installer"), (fmt_size(size) if size else "Not known", "Once installed"), last]
+        bw = (right - x - 32) / 3
+        for i, (value, label) in enumerate(stats):
+            bx = x + i * (bw + 16)
+            self.rrect(bx, y, bx + bw, y + 86, 10, outline=ROW_LINE, width=2)
+            self.text(bx + 20, y + 32, value, 30, TEXT, True)
+            self.text(bx + 20, y + 64, label, 18, MUTED)
+        y += 108
+        rating = self.detail_info.get("rating")
+        if rating:
+            tier = rating["tier"].upper()
+            w = self.width_of(tier, 17, True) + 24
+            self.rrect(x, y, x + w, y + 32, 6, fill=FOCUS)
+            self.text(x + w / 2, y + 16, tier, 17, GROUND, True, "center")
+            self.text(x + w + 12, y + 16, f"on ProtonDB · {rating['total']} reports", 21, MUTED)
+        elif self.detail_info.get("busy"):
+            self.text(x, y + 16, "Looking up ProtonDB…", 21, MUTED)
+        else:
+            self.text(x, y + 16, "No ProtonDB rating", 21, MUTED)
+        y += 64
+        label = "Install" if fits else "Not enough space"
+        end = self.button(x, y, label, "A", self.install_detail, primary=True, focused=self.detail_sel == 0,
+                          enabled=fits)
+        self.button(end + 24, y, "Unpick" if marked else "Pick for batch", "X", lambda: self.toggle_slug(g["slug"]),
+                    focused=self.detail_sel == 1, enabled=fits)
+        self.text(x, y + 112, "Runs GOG’s installer under Proton straight from the source. Nothing is copied first.",
+                  20, MUTED)
+        self.hints([("A", label if self.detail_sel == 0 else ("Unpick" if marked else "Pick"), fits, self.action_a),
+                    ("X", "Unpick" if marked else "Pick for batch", fits, self.action_x),
+                    ("B", "Back", True, self.action_b)])
 
     def game_rows(self):
-        """[(kind, label, value, on)] for the Game screen; kind: proton, fix, log, viewlog."""
+        """[(kind, label, value, on)] for an installed game; kind: proton, patch, fix, log, viewlog."""
         g = self.state["games"][self.game_slug]
         info = self.game_info
-        tools = self.tools or [(COMPAT_TOOL[0], COMPAT_TOOL[1])]
-        tool = g.get("proton") or COMPAT_TOOL[1]
-        label = next((t[0] for t in tools if t[1] == tool), tool)
-        rows = [("proton", "Proton", label, None)]
+        rows = [("proton", "Proton version", self.tool_label(g.get("proton")), None)]
         if info.get("ddrawcompat"):
             rows.append(("patch", "Skip GOG's DDrawCompat", "it crashes under Wine · edits the exe",
                          info["ddrawcompat"] == "on"))
@@ -2229,200 +2709,568 @@ class App:
             rows.append(("viewlog", "Last log", time.strftime("%d %b %H:%M", time.localtime(info["log"]["when"])), None))
         return rows
 
-    def draw_game(self):
+    def game_layout(self):
+        """(y of the first settings row, rows that fit) on the installed game's page."""
         g = self.state["games"][self.game_slug]
+        lines = len(self.wrap(g["title"], 52, True, 728, 2))
+        top = 168 + 54 * lines + 18 + 68 + 28 + 44
+        return top, max(1, int((716 - top) // 56))
+
+    def draw_game(self):
+        slug = self.game_slug
+        g = self.state["games"][slug]
         info = self.game_info
-        self.header(False)
-        self.text(40, 160, self.fit(g["title"], 56, True, 1200), 56, TEXT, True)
+        self.top_bar(back=("Library", self.action_b))
+        self.cover(56, 124, 384, 576, slug, g, g["title"], "play" if g.get("in_steam") else "check")
+        x, right = 496, 1224
+        if g.get("in_steam"):
+            end = self.chip(x, 142, "In Steam", "play", FOCUS, GROUND)
+        else:
+            end = self.chip(x, 142, "Not in Steam yet", "check", CHIP, TEXT)
+        meta = " · ".join(p for p in ("Installed", fmt_size(g.get("installed_size", 0)),
+                                      f"version {g['version']}" if g.get("version") else "") if p)
+        self.text(end + 14, 142, meta, 19, MUTED)
+        y = 168
+        for line in self.wrap(g["title"], 52, True, right - x, 2):
+            self.text(x, y + 27, line, 52, TEXT, True)
+            y += 54
+        y += 18
+        main = "Play" if g.get("in_steam") else "Add to Steam"
+        end = self.button(x, y, main, "A", self.main_action, primary=True,
+                          focused=self.game_sel == 0)
         if info.get("busy"):
             line = "Looking up ProtonDB…"
         elif info.get("rating"):
             r = info["rating"]
-            line = f"ProtonDB: {r['tier'].capitalize()} · {r['total']} reports"
+            tier = r["tier"].upper()
+            w = self.width_of(tier, 17, True) + 20
+            self.rrect(end + 28, y + 19, end + 28 + w, y + 49, 6, fill=FOCUS)
+            self.text(end + 28 + w / 2, y + 34, tier, 17, GROUND, True, "center")
+            end += w + 12
+            line = f"on ProtonDB · {r['total']} reports"
         elif info.get("steam_appid"):
             line = "No ProtonDB rating"
         else:
-            line = "Not on Steam, so ProtonDB has no reports for it"
-        self.text(40, 212, line, 26, MUTED)
+            line = "Not on Steam, so ProtonDB has no reports"
+        self.text(end + 28, y + 34, self.fit(line, 20, False, right - end - 28), 20, MUTED)
+        y += 68 + 28
+        self.text(x + 16, y + 12, "Proton settings", 22, TEXT, True)
+        if not g.get("in_steam"):
+            note = "Used when the game is added to Steam"
+        elif g.get("needs_update"):
+            note = "Changes waiting · Y applies them and restarts Steam"
+        else:
+            note = "Saved"
+        self.text(x + 16 + self.width_of("Proton settings", 22, True) + 14, y + 13, note, 18,
+                  WARN if g.get("needs_update") else MUTED)
         rows = self.game_rows()
-        visible = 6
-        self.game_sel = min(self.game_sel, len(rows) - 1)
-        if self.game_sel < self.game_top:
-            self.game_top = self.game_sel
-        elif self.game_sel >= self.game_top + visible:
-            self.game_top = self.game_sel - visible + 1
-        y = 248
+        top, visible = self.game_layout()
+        self.rect(x, top - 2, right, top, LINE)
+        self.game_sel = min(self.game_sel, len(rows))
+        if self.game_sel:
+            r = self.game_sel - 1
+            if r < self.game_top:
+                self.game_top = r
+            elif r >= self.game_top + visible:
+                self.game_top = r - visible + 1
+        if len(rows) > visible:
+            self.text(right - 16, y + 12, f"{self.game_top + 1}–{min(len(rows), self.game_top + visible)} of "
+                                          f"{len(rows)}", 18, MUTED, True, "e")
+        ry = top
         for i in range(self.game_top, min(self.game_top + visible, len(rows))):
             kind, label, value, on = rows[i]
-            focus = i == self.game_sel
+            focus = self.game_sel == i + 1
             if focus:
-                self.rect(0, y, 1280, y + 70, FOCUS)
+                self.rect(x, ry, right, ry + 56, FOCUS)
             else:
-                self.rect(0, y + 68, 1280, y + 70, ROW_LINE)
+                self.rect(x, ry + 54, right, ry + 56, ROW_LINE)
             fg = GROUND if focus else TEXT
-            cy = y + 35
-            x = 40
+            lx = x + 16
             if kind in ("fix", "log", "patch"):
-                self.checkbox(40, cy, on, fg, GROUND)
-                x = 84
-            self.text(x, cy, self.fit(label, 28, True, 620), 28, fg, True)
-            self.text(1240, cy, self.fit(value, 24, False, 480), 24, GROUND if focus else MUTED, False, "e")
-            self.hits.append((0, y, 1280, y + 70, lambda i=i: self.tap_game_row(i)))
-            y += 70
-        if len(rows) > visible:
-            self.text(1240, 212, f"{self.game_sel + 1} of {len(rows)}", 20, MUTED, True, "e")
-        self.rect(0, 724, 1280, 800, BAND)
-        kind = rows[self.game_sel][0]
-        action = {"proton": "Change", "viewlog": "View"}.get(kind, "Turn off" if rows[self.game_sel][3] else "Turn on")
+                self.checkbox(lx, ry + 28, on, GROUND if focus else MUTED, FOCUS if focus else GROUND)
+                lx += 42
+            if kind in ("proton", "viewlog"):
+                value = f"{value}  ›" if kind == "proton" else f"{value} · View  ›"
+            label = self.fit(label, 24, True, 380)
+            self.text(lx, ry + 28, label, 24, fg, True)
+            vx = lx + self.width_of(label, 24, True) + 20
+            self.text(right - 16, ry + 28, self.fit(value, 20, False, right - 16 - vx), 20,
+                      CHIP if focus else MUTED, False, "e")
+            self.hits.append((x, ry, right, ry + 56, lambda i=i: self.tap_game_row(i + 1)))
+            ry += 56
         count = self.pending_count()
-        self.legend([("A", action, True, self.action_a),
-                     ("Y", f"Add to Steam ({count})", count > 0, self.action_y),
-                     ("B", "Back", True, self.action_b)])
+        if self.game_sel == 0:
+            a = (main, True)
+        else:
+            kind, _, _, on = rows[self.game_sel - 1]
+            a = ({"proton": "Change", "viewlog": "View"}.get(kind, "Turn off" if on else "Turn on"), True)
+        self.hints([("A", a[0], a[1], self.action_a),
+                    ("Y", f"Apply and restart Steam ({count})" if g.get("needs_update") else f"Add to Steam ({count})",
+                     count > 0, self.action_y),
+                    ("B", "Back", True, self.action_b)])
+
+    def draw_proton_pick(self):
+        """The Proton version sheet, over the game's page or over Settings."""
+        if self.tool_for[0] == "game":
+            self.draw_game()
+        else:
+            self.draw_settings()
+        self.hits = []
+        self.canvas.create_rectangle(0, 0, 1280 * self.scale, FOOT * self.scale, fill=SCRIM, stipple="gray50",
+                                     width=0)
+        self.hits.append((0, 0, 740, FOOT, self.action_b))
+        self.rect(740, 0, 1280, FOOT, BAND)
+        self.rect(740, 0, 742, FOOT, LINE)
+        self.text(764, 72, "Proton version", 40, TEXT, True)
+        if self.tool_for[0] == "game":
+            title = self.state["games"][self.tool_for[1]]["title"]
+            note = f"For {title} only. Steam uses it from the next launch, after Y restarts Steam."
+        else:
+            note = "For the games you install from now on. Each game can still have its own."
+        for i, line in enumerate(self.wrap(note, 20, False, 490, 2)):
+            self.text(764, 116 + i * 26, line, 20, MUTED)
+        tools = self.tool_list()
+        current = self.current_tool()
+        top, visible = 176, int((FOOT - 176) // 68)
+        if self.tool_sel < self.tool_top:
+            self.tool_top = self.tool_sel
+        elif self.tool_sel >= self.tool_top + visible:
+            self.tool_top = self.tool_sel - visible + 1
+        self.rect(740, top - 2, 1280, top, LINE)
+        y = top
+        for i in range(self.tool_top, min(len(tools), self.tool_top + visible)):
+            label, name = tools[i]
+            focus = i == self.tool_sel
+            if focus:
+                self.rect(742, y, 1280, y + 68, FOCUS)
+            else:
+                self.rect(742, y + 66, 1280, y + 68, ROW_LINE)
+            fg = GROUND if focus else TEXT
+            if name == current:
+                self.icon("check", 780, y + 34, 24, fg, 3)
+            self.text(808, y + 34, self.fit(label, 26, True, 330), 26, fg, True)
+            if name == COMPAT_TOOL[1]:
+                self.text(1256, y + 34, "Default", 19, CHIP if focus else MUTED, False, "e")
+            self.hits.append((742, y, 1280, y + 68, lambda i=i: self.tap_tool(i)))
+            y += 68
+        self.hints([("A", "Choose", True, self.action_a), ("B", "Cancel", True, self.action_b)])
 
     def draw_game_log(self):
-        info = self.game_info.get("log") or {"lines": [], "file": ""}
-        self.header(False)
-        self.text(40, 160, "Last Proton log", 56, TEXT, True)
-        self.text(40, 212, self.fit(info["file"].replace(HOME, "~"), 24, False, 1200), 24, MUTED)
-        y = 260
-        for line in info["lines"] or ["No errors found in the log."]:
-            self.text(40, y, self.fit(line, 24, False, 1200), 24, TEXT)
-            y += 52
-        self.buttons(("Back", self.action_b))
+        g = self.state["games"][self.game_slug]
+        info = self.game_info.get("log") or {"lines": [], "file": "", "when": 0}
+        self.top_bar(back=(self.fit(g["title"], 22, True, 320), self.action_b), title="Last Proton log", free=False)
+        when = time.strftime("%d %b %H:%M", time.localtime(info["when"])) if info.get("when") else "No log yet"
+        self.text(56, 146, when, 34, TEXT, True)
+        n = len(info["lines"])
+        found = f"{n} problem{'s' if n != 1 else ''} found in the log" if n else "No errors found in the log"
+        self.text(56 + self.width_of(when, 34, True) + 16, 148, f"{self.tool_label(g.get('proton'))} · {found}", 20,
+                  MUTED)
+        self.text(56, 184, self.fit(info["file"].replace(HOME, "~"), 18, False, 1168), 18, DIM)
+        if info["lines"]:
+            y = 212
+            self.rrect(56, y, 1224, y + 54 * len(info["lines"]), 12, fill=BAND)
+            for i, line in enumerate(info["lines"]):
+                ly = y + 54 * i
+                if i:
+                    self.rect(56, ly, 1224, ly + 2, ROW_LINE)
+                self.circle(82, ly + 27, 5, fill=WARN)
+                self.text(102, ly + 27, self.fit(line, 17, False, 1100, mono=True), 17, TEXT, mono=True)
+            y += 54 * len(info["lines"]) + 24
+        else:
+            y = 236
+        self.text(56, y + 10, "Only lines with errors are shown. A fix on the game’s page often helps: turn one on, "
+                              "then launch again with a new log.", 20, MUTED)
+        self.hints([("X", f"Log next launch: {'on' if g.get('log') else 'off'}", True, self.action_x),
+                    ("B", "Back", True, self.action_b)])
 
-    def draw_offline(self):
-        self.header(False)
-        if not self.cfg["sources"]:
-            self.text(40, 200, "Add where your installers are", 72, TEXT, True)
-            self.text(40, 280, "Press Start for Settings, then add an SMB share or a USB drive.", 32)
-            self.buttons(("Open Settings", self.action_menu), ("Quit", self.action_b))
-            return
-        self.text(1240, 54, "Not connected", 22, WARN, False, "e")
-        self.text(40, 200, "Can’t reach your installers", 72, TEXT, True)
-        self.text(40, 280, "Check that the server is on and on the same network, or that the drive is plugged in.", 32)
-        y = 350
-        for src, err in self.source_errors[:4]:
-            kind, where, folder = source_label(src)
-            self.text(40, y, self.fit(f"{kind}  {where}  {folder}", 26, True, 560), 26, MUTED, True)
-            self.text(640, y, self.fit(err, 24, False, 600), 24, MUTED)
-            y += 44
-        self.buttons(("Try again", self.action_a), ("Quit", self.action_b))
-        self.legend([("≡", "Settings", True, self.action_menu)], 740)
-
-    def draw_failed(self):
-        self.header(False)
-        names = ", ".join(g["title"] for g in self.failed)
-        self.text(40, 190, self.fit(names, 28, False, 1200), 28, MUTED)
-        self.text(40, 256, "The install didn’t finish" if len(self.failed) < 2 else f"{len(self.failed)} installs didn’t finish", 72, TEXT, True)
-        self.text(40, 336, self.fit(self.message, 32, False, 1200), 32)
-        self.text(40, 390, f"Details: {LOG_FILE.replace(HOME, '~')}", 26, MUTED)
-        self.buttons(("Try again", self.action_a), ("Back to the list", self.action_b))
+    def draw_installing(self):
+        g = self.current
+        n = self.queue_total
+        self.top_bar(title=f"Installing {self.queue_done + 1} of {n}" if n > 1 else "Installing")
+        self.cover(56, 124, 336, 504, g["slug"], g, g["title"])
+        self.rect(56, 620, 392, 628, LINE)
+        phase = (time.monotonic() * 0.45) % 1.4 - 0.4  # an indeterminate bar: the installer reports no progress
+        x0, x1 = max(56, 56 + 336 * phase), min(392, 56 + 336 * (phase + 0.4))
+        if x1 > x0:
+            self.rect(x0, 620, x1, 628, FOCUS)
+        x, right = 448, 1224
+        elapsed = fmt_elapsed(time.monotonic() - self.install_started)
+        self.text(x, 140, f"{elapsed} so far · from {g.get('source', '')} · nothing is copied first", 22, MUTED)
+        y = 164
+        for line in self.wrap(g["title"], 64, True, right - x, 2):
+            self.text(x, y + 32, line, 64, TEXT, True)
+            y += 66
+        y += 14
+        self.rect(x, y, right, y + 2, ROW_LINE)
+        steps = [("done", f"Connected to {g.get('where') or g.get('source', 'the source')}", ""),
+                 ("now", "Running GOG’s installer", "In its own window under Proton. No input needed."),
+                 ("next", "Find the game and get it ready for Steam", "")]
+        for state, label, sub in steps:
+            h = 84 if state == "now" else 64
+            if state == "now":
+                self.rect(x - 16, y + 2, right, y + h, BAND)
+            cy = y + 2 + h / 2
+            if state == "done":
+                self.circle(x + 17, cy, 17, fill=FOCUS)
+                self.icon("check", x + 17, cy, 20, GROUND, 3)
+                self.text(x + 52, cy, label, 24, MUTED)
+            elif state == "now":
+                self.circle(x + 17, cy, 15, outline=FOCUS, width=3)
+                self.circle(x + 17, cy, 6, fill=FOCUS)
+                self.text(x + 52, cy - 14, label, 28, TEXT, True)
+                self.text(x + 52, cy + 18, sub, 19, MUTED)
+            else:
+                self.circle(x + 17, cy, 16, outline=LINE, width=2)
+                self.text(x + 52, cy, label, 24, MUTED)
+            y += h
+            self.rect(x, y, right, y + 2, ROW_LINE)
+        if self.queue:
+            y += 26
+            self.text(x, y + 72, "Up next", 20, MUTED, True)
+            mx = x + 90
+            for q in self.queue[:4]:
+                self.cover(mx, y, 96, 144, q["slug"], q, q["title"])
+                mx += 116
+            rest = len(self.queue) - 4
+            note = (f"and {rest} more. " if rest > 0 else "") + "Then Y adds them to Steam in one restart."
+            for i, line in enumerate(self.wrap(note, 19, False, right - mx - 8, 3)):
+                self.text(mx + 8, y + 52 + i * 26, line, 19, MUTED)
+        armed = time.monotonic() < self.stop_armed_until
+        self.hints([("X", "Skip the rest of the queue", True, self.action_x) if self.queue else None,
+                    ("B", "Press B again to stop" if armed else "Stop (press twice)", True, self.action_b,
+                     WARN if armed else TEXT)])
 
     def draw_pick_exe(self):
-        self.header(False)
-        self.text(40, 160, "Which file starts the game?", 56, TEXT, True)
-        self.text(40, 216, self.current["title"], 28, MUTED)
-        base = f"{prefix_dir(self.current['slug'])}/pfx/drive_c/"
-        y = 256
-        for i in range(self.exe_top, min(self.exe_top + 5, len(self.exes))):
+        g = self.current
+        self.top_bar(title="Almost done", free=False)
+        self.cover(56, 124, 224, 336, g["slug"], g, g["title"])
+        x, right = 328, 1224
+        self.text(x, 152, "Which file starts the game?", 52, TEXT, True)
+        note = "The installer finished, but the game doesn’t say which program to run. Steam will start the one you pick."
+        for i, line in enumerate(self.wrap(note, 22, False, right - x, 2)):
+            self.text(x, 200 + i * 28, line, 22, MUTED)
+        base = f"{prefix_dir(g['slug'])}/pfx/drive_c/"
+        top, visible = 262, int((716 - 262) // 72)
+        self.rect(x, top - 2, right, top, ROW_LINE)
+        y = top
+        for i in range(self.exe_top, min(self.exe_top + visible, len(self.exes))):
             on = i == self.exe_sel
             if on:
-                self.rect(0, y, 1280, y + 80, FOCUS)
-            name = self.exes[i].replace(base, "")
-            self.text(40, y + 40, self.fit(name, 28, on, 1200), 28, GROUND if on else TEXT, on)
-            self.hits.append((0, y, 1280, y + 80, lambda i=i: self.tap_exe(i)))
-            y += 80
-        self.buttons(("Use this file", self.action_a), ("Cancel install", self.action_b))
-
-    def edit_rows(self):
-        """(label, value, editable) for the source being edited."""
-        src = self.draft[self.edit_idx]
-        if src["type"] == "smb":
-            return [("Server", src.get("server") or "Choose…", True), ("Share", src.get("share") or "Choose…", True),
-                    ("Folder", src.get("folder") or "(top of the share)", True)]
-        return [("Drive", src.get("label") or "Choose…", True),
-                ("Folder", src.get("folder") or "(top of the drive)", True)]
-
-    def row_list(self, rows, sel, top=256, height=84):
-        """Settings-style rows: [(left, right, enabled)]; returns the y after the last row."""
-        y = top
-        for i, (left, right, enabled) in enumerate(rows):
-            on = i == sel
-            if on:
-                self.rect(0, y, 1280, y + height, FOCUS)
+                self.rect(x, y, right, y + 72, FOCUS)
             else:
-                self.rect(0, y + height - 2, 1280, y + height, ROW_LINE)
-            fg = GROUND if on else (TEXT if enabled else MUTED)
-            self.text(40, y + height / 2, left, 30, fg, True)
-            self.text(1240, y + height / 2, self.fit(right, 28, False, 980), 28, fg, False, "e")
-            self.hits.append((0, y, 1280, y + height, lambda i=i: self.tap_row_in_list(i)))
-            y += height
-        return y
+                self.rect(x, y + 70, right, y + 72, ROW_LINE)
+            fg, soft = (GROUND, CHIP) if on else (TEXT, MUTED)
+            self.icon("file", x + 34, y + 36, 26, fg, 2)
+            rel = self.exes[i].replace(base, "")
+            folder, name = os.path.dirname(rel), os.path.basename(rel)
+            size = fmt_size(self.exe_sizes[i]) if self.exe_sizes[i] >= 0 else ""
+            tag = "MOST LIKELY" if i == self.exe_likely else ""
+            room = right - 20 - (self.width_of(size, 19) + 24) - (self.width_of(tag, 16, True) + 40 if tag else 0)
+            name_w = self.width_of(name, 26, True)
+            folder = self.fit(folder + "/", 26, False, max(40, room - x - 64 - name_w)) if folder else ""
+            tx = x + 64
+            self.text(tx, y + 36, folder, 26, soft)
+            tx += self.width_of(folder, 26)
+            self.text(tx, y + 36, self.fit(name, 26, True, room - tx), 26, fg, True)
+            tx += min(name_w, room - tx) + 14
+            if tag:
+                w = self.width_of(tag, 16, True) + 20
+                self.rrect(tx, y + 22, tx + w, y + 50, 6, fill=GROUND)
+                self.text(tx + w / 2, y + 36, tag, 16, FOCUS, True, "center")
+            self.text(right - 20, y + 36, size, 19, soft, False, "e")
+            self.hits.append((x, y, right, y + 72, lambda i=i: self.tap_exe(i)))
+            y += 72
+        self.hints([("A", "Use this file", True, self.action_a), ("B", "Cancel install", True, self.action_b)])
+
+    def draw_add_to_steam(self):
+        pending = list(pending_games(self.state).items())
+        n = len(pending)
+        updates = sum(1 for _, g in pending if g.get("in_steam"))
+        verb = "Update" if updates == n else ("Add" if not updates else "Add or update")
+        self.text(56, 90, self.fit(f"{verb} {n} game{'s' if n != 1 else ''} in Steam?", 60, True, 1168), 60, TEXT, True)
+        x = 56
+        for slug, g in pending[:5]:
+            self.cover(x, 150, 200, 300, slug, g, g["title"])
+            note = "New Proton settings" if g.get("in_steam") else f"New · {fmt_size(g.get('installed_size', 0))}"
+            self.text(x, 476, self.fit(note, 19, False, 200), 19, MUTED)
+            x += 232
+        if n > 5:
+            self.text(x, 300, f"and {n - 5} more", 26, MUTED, True)
+        self.text(56, 540, "Steam closes and reopens, which takes about 20 seconds. This app closes too.", 24)
+        self.text(56, 576, "Cover art is downloaded first, so the games look right when Steam is back.", 22, MUTED)
+        self.rect(0, 680, 1280, 800, BAND)
+        end = self.button(56, 706, "Add and restart Steam", "A", self.action_a, primary=True, focused=True)
+        self.button(end + 24, 706, "Not now", "B", self.action_b)
+
+    def draw_failed(self):
+        failed = self.failed
+        ok = max(0, self.queue_total - len(failed))
+        x = self.top_bar(title="Queue finished" if self.queue_total > 1 else "Install", free=False)
+        if self.queue_total > 1:
+            self.text(x + 16, 46, f"{ok} installed · {len(failed)} didn’t finish", 20, MUTED)
+        g = failed[0]
+        self.cover(56, 124, 336, 504, g["slug"], g, g["title"], "fail")
+        x, right = 448, 1224
+        self.text(x, 146, "The install didn’t finish" if len(failed) == 1 else f"{len(failed)} installs didn’t finish",
+                  22, WARN, True)
+        y = 170
+        for line in self.wrap(g["title"], 48, True, right - x, 2):
+            self.text(x, y + 25, line, 48, TEXT, True)
+            y += 52
+        if len(failed) > 1:
+            self.text(x, y + 14, self.fit("Also: " + ", ".join(f["title"] for f in failed[1:]), 20, False, right - x),
+                      20, MUTED)
+            y += 32
+        y += 12
+        for line in self.wrap(self.message or "The installer stopped.", 24, False, right - x, 2):
+            self.text(x, y + 15, line, 24, TEXT)
+            y += 32
+        y += 14
+        lines = tail_lines(LOG_FILE, 4)
+        h = 26 * len(lines) + 54
+        self.rrect(x, y, right, y + h, 10, fill=BAND)
+        for i, line in enumerate(lines):
+            self.text(x + 20, y + 26 + 26 * i, self.fit(line, 15, False, right - x - 40, mono=True), 15, MUTED,
+                      mono=True)
+        self.text(x + 20, y + h - 22, LOG_FILE.replace(HOME, "~"), 17, MUTED)
+        y += h + 26
+        end = self.button(x, y, "Try again", "A", self.action_a, primary=True, focused=True)
+        self.button(end + 24, y, "Back to the library", "B", self.action_b)
+        self.hints([("A", "Try again", True, self.action_a), ("B", "Back", True, self.action_b)])
+
+    # settings ------------------------------------------------------------------------
+    def settings_items(self):
+        return [("source", i) for i in range(len(self.draft))] + [("add",), ("proton",), ("protondb",)]
 
     def draw_settings(self):
-        self.header(False)
-        self.text(40, 160, "Settings", 56, TEXT, True)
-        self.text(40, 216, "Where your GOG installers are. Games from every source show in one list.", 28, MUTED)
-        rows = []
-        for src in self.draft:
-            kind, where, folder = source_label(src)
-            rows.append((kind, f"{where}   {folder}", True))
-        rows.append(("Add a source", "", True))
-        first = max(0, self.set_sel - 4)
-        self.row_list(rows[first:first + 5], self.set_sel - first)
-        on_source = self.set_sel < len(self.draft)
-        self.buttons(("Edit" if on_source else "Add", self.action_a), ("Done", self.action_b))
-        self.legend([("X", "Remove", on_source, self.action_x)], 740)
-
-    def draw_edit_source(self):
-        self.header(False)
-        kind = source_label(self.draft[self.edit_idx])[0]
-        self.text(40, 160, {"SMB": "SMB share", "USB": "USB drive"}[kind], 56, TEXT, True)
-        self.row_list(self.edit_rows(), self.edit_sel)
-        self.buttons(("Change", self.action_a), ("Back", self.action_b))
-        self.legend([("X", "Remove source", True, self.action_x)], 740)
-
-    def draw_edit_field(self):
-        self.header(False)
-        self.text(40, 160, "Server address", 56, TEXT, True)
-        self.text(40, 216, "Press Steam + X for the on-screen keyboard", 28, MUTED)
-        self.rect(40, 270, 1240, 360, FOCUS)
-        self.text(64, 315, self.field + "_", 40, GROUND, True)
-        self.buttons(("Done", self.action_a), ("Cancel", self.action_b))
-
-    PICK_TITLES = {"pick_type": "Add a source", "pick_share": "Choose a share", "pick_drive": "Choose a drive",
-                   "pick_folder": "Choose a folder"}
-    PICK_EMPTY = {"pick_share": "No shares found for guests",
-                  "pick_drive": "No drive found. Plug one in, then press A to look again.",
-                  "pick_folder": "No folders here. Press B to use this one."}
-
-    def draw_pick(self):
-        self.header(False)
-        self.text(40, 160, self.PICK_TITLES[self.screen], 56, TEXT, True)
-        if self.screen == "pick_folder":
-            src = self.draft[self.edit_idx]
-            base = src.get("share") if src["type"] == "smb" else source_label(src)[1]
-            self.text(40, 216, f"{base}/{self.browse_path}".rstrip("/"), 28, MUTED)
-        if self.busy:
-            self.text(40, 300, self.busy, 32, MUTED)
-        elif not self.pick:
-            self.text(40, 300, self.PICK_EMPTY.get(self.screen, ""), 32, MUTED)
-        y = 256
-        for i in range(self.pick_top, min(self.pick_top + 5, len(self.pick))):
-            on = i == self.pick_sel
-            if on:
-                self.rect(0, y, 1280, y + 80, FOCUS)
-            self.text(40, y + 40, self.fit(self.pick[i], 30, on, 1200), 30, GROUND if on else TEXT, on)
-            self.hits.append((0, y, 1280, y + 80, lambda i=i: self.tap_pick(i)))
-            y += 80
-        if self.screen == "pick_folder":
-            self.buttons(("Open", self.action_a), ("Use this folder", self.action_b))
+        self.top_bar(back=("Library", self.action_b), title="Settings", free=False)
+        self.text(56, 140, "Sources", 34, TEXT, True)
+        self.text(56, 178, "Where your GOG installers are. Games from every source show in one library.", 20, MUTED)
+        items = self.settings_items()
+        cards, visible = len(self.draft) + 1, 4
+        if self.set_sel < cards:
+            if self.set_sel < self.set_top:
+                self.set_top = self.set_sel
+            elif self.set_sel >= self.set_top + visible:
+                self.set_top = self.set_sel - visible + 1
+        y, x0, x1 = 210, 56, 796
+        for k in range(self.set_top, min(cards, self.set_top + visible)):
+            focus = self.set_sel == k
+            if focus:
+                self.rrect(x0 - 8, y - 8, x1 + 8, y + 104, 16, outline=FOCUS, width=4)
+            if k < len(self.draft):
+                src = self.draft[k]
+                self.rrect(x0, y, x1, y + 96, 12, fill=BAND if focus else "", outline=FOCUS if focus else ROW_LINE,
+                           width=2)
+                self.rrect(x0 + 24, y + 20, x0 + 80, y + 76, 10, fill=CHIP)
+                self.icon("server" if src["type"] == "smb" else "usb", x0 + 52, y + 48, 30, TEXT, 2)
+                kind, where, folder = source_label(src)
+                sub = ("Network share" if src["type"] == "smb" else "USB drive") + \
+                    (" · " + folder.replace("/", " / ") if folder else "")
+                color, status = self.source_status(src)
+                sw = self.width_of(status, 19) + 18
+                self.circle(x1 - 24 - sw + 5, y + 48, 5, fill=WARN if color == WARN else FOCUS if color == FOCUS
+                            else DIM)
+                self.text(x1 - 24, y + 48, status, 19, WARN if color == WARN else MUTED, False, "e")
+                room = x1 - 24 - sw - 24 - (x0 + 100)
+                self.text(x0 + 100, y + 36, self.fit(where, 26, True, room), 26, TEXT, True)
+                self.text(x0 + 100, y + 66, self.fit(sub, 19, False, room), 19, MUTED)
+            else:
+                self.rrect(x0, y, x1, y + 96, 12, outline=FOCUS if focus else LINE, width=2, dash=(6, 4))
+                self.rrect(x0 + 24, y + 20, x0 + 80, y + 76, 10, outline=LINE, width=2, dash=(4, 3))
+                self.icon("plus", x0 + 52, y + 48, 26, MUTED, 2.5)
+                self.text(x0 + 100, y + 48, "Add a source", 26, MUTED if not focus else TEXT, True)
+            self.hits.append((x0, y, x1, y + 96, lambda k=k: self.tap_setting(k)))
+            y += 112
+        if cards > visible:
+            self.text(x1, 140, f"{self.set_top + 1}–{min(cards, self.set_top + visible)} of {cards}", 18, MUTED,
+                      True, "e")
+        px0, px1 = 844, 1224
+        self.panel(px0, 210, px1, 594)
+        self.text(px0 + 24, 238, "On this Deck", 24, TEXT, True)
+        free, total = free_space()
+        self.text(px0 + 24, 276, f"{fmt_free(free)} free of {fmt_free(total)}", 20, TEXT)
+        self.rrect(px0 + 24, 296, px1 - 24, 302, 3, fill=LINE)
+        used = (px1 - px0 - 48) * (1 - free / total) if total else 0
+        if used > 6:
+            self.rrect(px0 + 24, 296, px0 + 24 + used, 302, 3, fill=MUTED)
+        if self.protondb_job:
+            updated = "Updating…"
+        elif os.path.exists(PROTONDB_INDEX):
+            updated = time.strftime("Updated %d %b", time.localtime(os.path.getmtime(PROTONDB_INDEX)))
         else:
-            self.buttons(("Look again" if self.screen == "pick_drive" and not self.pick and not self.busy
-                          else "Choose", self.action_a), ("Back", self.action_b))
+            updated = "Not downloaded yet"
+        installed = self.state["games"].values()
+        rows = [("proton", "Proton for new games", self.tool_label(self.cfg.get("proton")) + "  ›"),
+                ("protondb", "ProtonDB suggestions", updated + ("" if self.protondb_job else "  ›")),
+                (None, "Installed games", f"{len(installed)} · {fmt_size(sum(g.get('installed_size', 0) for g in installed))}")]
+        y = 322
+        for kind, label, value in rows:
+            k = next((i for i, it in enumerate(items) if it[0] == kind), None)
+            focus = k is not None and self.set_sel == k
+            if focus:
+                self.rect(px0, y, px1, y + 72, FOCUS)
+            else:
+                self.rect(px0 + 24, y, px1 - 24, y + 2, ROW_LINE)
+            fg = GROUND if focus else TEXT
+            self.text(px0 + 24, y + 24, label, 22, fg, True)
+            self.text(px0 + 24, y + 50, self.fit(value, 19, False, px1 - px0 - 48), 19, CHIP if focus else MUTED)
+            if k is not None:
+                self.hits.append((px0, y, px1, y + 72, lambda k=k: self.tap_setting(k)))
+            y += 72
+        self.text(px0 + 24, y + 22, "ProtonDB data export, ODbL.", 16, MUTED)
+        item = items[self.set_sel]
+        a = {"source": "Edit", "add": "Add", "proton": "Change", "protondb": "Refresh"}[item[0]]
+        self.hints([("A", a, not (item[0] == "protondb" and self.protondb_job), self.action_a),
+                    ("X", "Remove", item[0] == "source", self.action_x),
+                    ("B", "Done", True, self.action_b)])
 
     def draw_pick_type(self):
-        self.draw_pick()
+        self.top_bar(back=("Settings", self.action_b), title="Add a source", free=False)
+        self.text(56, 150, "Where are the installers?", 34, TEXT, True)
+        self.text(56, 192, "Either way they are only read, never changed, and nothing is copied to the Deck.", 22, MUTED)
+        tiles = [("server", "Network share", "A guest SMB share on your network, such as a NAS or another computer."),
+                 ("usb", "USB drive or SD card", "Plugged into the Deck or its dock. Works without a network.")]
+        for i, (icon, title, desc) in enumerate(tiles):
+            x0 = 56 + i * 604
+            x1, y0, y1 = x0 + 564, 236, 636
+            focus = i == self.pick_sel
+            if focus:
+                self.rrect(x0 - 10, y0 - 10, x1 + 10, y1 + 10, 22, outline=FOCUS, width=4)
+            self.rrect(x0, y0, x1, y1, 16, fill=BAND if focus else "", outline=FOCUS if focus else ROW_LINE, width=2)
+            self.rrect(x0 + 40, y0 + 40, x0 + 136, y0 + 136, 18, fill=CHIP)
+            self.icon(icon, x0 + 88, y0 + 88, 52, TEXT, 2.4)
+            self.text(x0 + 40, y0 + 290, title, 40, TEXT, True)
+            for j, line in enumerate(self.wrap(desc, 22, False, 484, 2)):
+                self.text(x0 + 40, y0 + 334 + j * 30, line, 22, MUTED)
+            self.hits.append((x0, y0, x1, y1, lambda i=i: self.tap_pick(i)))
+        self.hints([("A", "Choose", True, self.action_a), ("B", "Back", True, self.action_b)])
+
+    def edit_rows(self):
+        """(label, value, set) for the source being edited."""
+        src = self.draft[self.edit_idx]
+        if src["type"] == "smb":
+            return [("Server", src.get("server") or "Type an address", bool(src.get("server"))),
+                    ("Share", src.get("share") or "Choose…", bool(src.get("share"))),
+                    ("Folder", src.get("folder") or "(top of the share)", True)]
+        return [("Drive", src.get("label") or "Choose…", bool(src.get("label"))),
+                ("Folder", src.get("folder") or "(top of the drive)", True)]
+
+    def draw_edit_source(self):
+        src = self.draft[self.edit_idx]
+        editing = self.screen == "edit_field"
+        smb = src["type"] == "smb"
+        self.top_bar(back=("Settings", self.action_b), title="Network share" if smb else "USB drive", free=False)
+        y = 116
+        for i, (label, value, is_set) in enumerate(self.edit_rows()):
+            focus = i == self.edit_sel
+            self.text(56, y + 16, label, 20, MUTED, True)
+            by = y + 40
+            if focus:
+                self.rrect(48, by - 8, 804, by + 80, 14, outline=FOCUS, width=4)
+            self.rrect(56, by, 796, by + 72, 10, fill=GROUND, outline=FOCUS if focus else LINE, width=2)
+            if editing and label == "Server":
+                shown = self.fit(self.field, 30, True, 500)
+                self.text(76, by + 36, shown, 30, TEXT, True)
+                cx = 76 + self.width_of(shown, 30, True) + 3
+                self.rect(cx, by + 19, cx + 3, by + 53, FOCUS)
+                hint = "Steam + X: keyboard"
+            else:
+                self.text(76, by + 36, self.fit(value, 30, True, 520), 30, TEXT if is_set else MUTED, True)
+                hint = "Type" if label == "Server" else "Choose  ›"
+            self.text(776, by + 36, hint, 20, MUTED, False, "e")
+            if not editing:
+                self.hits.append((56, by, 796, by + 72, lambda i=i: self.tap_edit_row(i)))
+            y += 128
+        color, status = self.source_status(src)
+        self.panel(844, 156, 1224, 420)
+        if color == FOCUS:
+            self.circle(884, 196, 20, fill=FOCUS)
+            self.icon("check", 884, 196, 22, GROUND, 3)
+            head, detail = "Connected", f"{status.split(' · ')[1]} in {source_label(src)[2] or 'the top folder'}"
+        elif color == WARN:
+            self.circle(884, 196, 20, fill=WARN)
+            self.icon("warn", 884, 196, 22, GROUND, 3)
+            err = next((e for s, e in self.source_errors if s == src), "")
+            head, detail = status, err or "Choose the missing parts on the left."
+        else:
+            self.circle(884, 196, 18, outline=LINE, width=2)
+            head, detail = "Not checked yet", "Checked when you leave Settings."
+        self.text(916, 196, head, 26, TEXT, True)
+        for j, line in enumerate(self.wrap(detail, 21, False, 332, 4)):
+            self.text(868, 244 + j * 30, line, 21, TEXT)
+        note = "Guest access, read-only." if smb else "Read-only. The drive is never changed."
+        self.rect(868, 368, 1200, 370, ROW_LINE)
+        self.text(868, 394, note, 18, MUTED)
+        if editing:
+            self.hints([("A", "Done", True, self.action_a), ("B", "Cancel", True, self.action_b)])
+        else:
+            label = self.edit_rows()[self.edit_sel][0]
+            self.hints([("A", "Type" if label == "Server" else "Choose", True, self.action_a),
+                        ("X", "Remove source", True, self.action_x),
+                        ("B", "Back", True, self.action_b)])
+
+    def draw_edit_field(self):
+        self.draw_edit_source()
+
+    def draw_pick(self):
+        src = self.draft[self.edit_idx]
+        smb = src["type"] == "smb"
+        folder_mode = self.screen == "pick_folder"
+        self.top_bar(back=("Network share" if smb else "USB drive", self.action_b), title=self.PICK_TITLES[self.screen],
+                     free=False)
+        top = 128
+        if folder_mode:
+            parts = ([src.get("server", ""), src.get("share", "")] if smb else [source_label(src)[1]])
+            parts += [p for p in self.browse_path.split("/") if p]
+            x, y = 56, 128
+            widths = [self.width_of(p, 20, True) + 28 for p in parts]
+            while len(parts) > 2 and sum(widths) + 26 * len(parts) > 1168:
+                parts, widths = ["…"] + parts[2:], [self.width_of("…", 20, True) + 28] + widths[2:]
+            for i, (p, w) in enumerate(zip(parts, widths)):
+                last = i == len(parts) - 1
+                self.rrect(x, y - 22, x + w, y + 22, 22, fill=CHIP if last else BAND)
+                self.text(x + 14, y, p, 20, TEXT, True)
+                x += w
+                if not last:
+                    self.text(x + 13, y, "›", 20, DIM, False, "center")
+                    x += 26
+            top = 176
+        right = 796 if folder_mode else 1224
+        visible = self.pick_rows = int((716 - top) // 68)
+        self.rect(56, top - 2, right, top, ROW_LINE)
+        if self.busy:
+            self.text(76, top + 40, self.busy, 26, MUTED)
+        elif not self.pick:
+            self.text(76, top + 40, self.PICK_EMPTY[self.screen], 26, MUTED)
+        y = top
+        icon = {"pick_share": "folder", "pick_drive": "usb", "pick_folder": "folder"}[self.screen]
+        for i in range(self.pick_top, min(self.pick_top + visible, len(self.pick))):
+            on = i == self.pick_sel
+            if on:
+                self.rect(56, y, right, y + 68, FOCUS)
+            else:
+                self.rect(56, y + 66, right, y + 68, ROW_LINE)
+            fg = GROUND if on else TEXT
+            self.icon(icon, 90, y + 34, 28, fg, 2)
+            self.text(124, y + 34, self.fit(self.pick[i], 26, True, right - 144), 26, fg, True)
+            self.hits.append((56, y, right, y + 68, lambda i=i: self.tap_pick(i)))
+            y += 68
+        if folder_mode:
+            self.panel(844, top, 1224, top + 250)
+            self.text(868, top + 34, "This folder", 18, MUTED)
+            here = "/".join(p for p in ([src.get("share", "")] if smb else []) + [self.browse_path] if p) or \
+                "Top of the drive"
+            self.text(868, top + 72, self.fit(here.replace("/", " / "), 30, True, 332), 30, TEXT, True)
+            self.text(868, top + 112, "Games are the folders inside it.", 20, MUTED)
+            self.button(868, top + 154, "Use this folder", "Y", self.action_y, h=64, size=26, enabled=not self.busy)
+            self.hints([("A", "Open", bool(self.pick) and not self.busy, self.action_a),
+                        ("Y", "Use this folder", not self.busy, self.action_y),
+                        ("B", "Up one level" if self.browse_path else "Back", True, self.action_b)])
+        else:
+            look = self.screen == "pick_drive" and not self.pick and not self.busy
+            self.hints([("A", "Look again" if look else "Choose", look or bool(self.pick), self.action_a),
+                        ("B", "Back", True, self.action_b)])
 
     def draw_pick_share(self):
         self.draw_pick()
@@ -2433,7 +3281,62 @@ class App:
     def draw_pick_folder(self):
         self.draw_pick()
 
-    # game screen actions -------------------------------------------------------------
+    # library and game actions --------------------------------------------------------
+    def set_tab(self, tab):
+        self.tab, self.sel, self.top = tab, 0, 0
+        self.draw()
+
+    def switch_tab(self, step):
+        if self.screen == "library":
+            names = [t for t, _ in TABS]
+            self.set_tab(names[(names.index(self.tab) + step) % len(names)])
+
+    def tap_cover(self, i):
+        self.sel = i
+        self.open_entry()
+
+    def open_entry(self):
+        if not self.shown:
+            return
+        e = self.shown[min(self.sel, len(self.shown) - 1)]
+        if e["slug"] in self.state["games"]:
+            self.open_game(e["slug"])
+        elif e["game"]:
+            self.open_details(e["game"])
+
+    def toggle_mark(self, i=None):
+        i = self.sel if i is None else i
+        if 0 <= i < len(self.shown) and self.shown[i]["status"] == "down":
+            self.toggle_slug(self.shown[i]["slug"])
+
+    def toggle_slug(self, slug):
+        if slug in self.marked:
+            self.marked.discard(slug)
+        elif slug not in self.state["games"]:
+            g = next((x for x in self.games if x["slug"] == slug), None)
+            reserved = sum(needed_bytes(x, self.state) for x in self.games if x["slug"] in self.marked)
+            if g and needed_bytes(g, self.state) + reserved < free_space()[0]:
+                self.marked.add(slug)
+        self.draw()
+
+    def open_details(self, g):
+        self.detail_slug, self.detail_sel, self.detail_info = g["slug"], 0, {"busy": bool(g.get("steam_appid"))}
+        appid, slug = g.get("steam_appid"), g["slug"]
+        if appid:
+            def work():
+                try:
+                    info = {"rating": protondb_rating(appid)}
+                except (OSError, ValueError, KeyError):
+                    info = {}
+                self.events.put(("detailinfo", slug, info))
+            threading.Thread(target=work, daemon=True).start()
+        self.go("details")
+
+    def install_detail(self):
+        g = self.detail_game()
+        if g:
+            self.start_queue([g])
+
     def open_game(self, slug):
         self.game_slug, self.game_sel, self.game_top = slug, 0, 0
         self.game_info = {"busy": True}
@@ -2457,6 +3360,14 @@ class App:
         threading.Thread(target=work, daemon=True).start()
         self.go("game")
 
+    def main_action(self):
+        g = self.state["games"][self.game_slug]
+        if not g.get("in_steam"):
+            self.action_y()
+            return
+        launch_game(self.game_slug)
+        self.root.after(1500, self.quit)  # Steam takes over the screen; this app isn't needed while playing
+
     def change_game(self, mutate):
         g = self.state["games"][self.game_slug]
         mutate(g)
@@ -2473,15 +3384,9 @@ class App:
             self.draw()
 
     def game_change(self):
-        kind, label, value, on = self.game_rows()[self.game_sel]
+        kind, label, value, on = self.game_rows()[self.game_sel - 1]
         if kind == "proton":
-            tools = self.tools or [(COMPAT_TOOL[0], COMPAT_TOOL[1])]
-            names = [t[1] for t in tools]
-
-            def next_tool(g):
-                current = g.get("proton") or COMPAT_TOOL[1]
-                g["proton"] = names[(names.index(current) + 1) % len(names)] if current in names else names[0]
-            self.change_game(next_tool)
+            self.open_tool_pick(("game", self.game_slug))
         elif kind == "fix":
             fix = value if value and parse_launch_option(value) else label
 
@@ -2502,10 +3407,42 @@ class App:
         elif kind == "viewlog":
             self.go("game_log")
 
+    def current_tool(self):
+        if self.tool_for[0] == "game":
+            return self.state["games"][self.tool_for[1]].get("proton") or COMPAT_TOOL[1]
+        return self.cfg.get("proton") or COMPAT_TOOL[1]
+
+    def open_tool_pick(self, target):
+        self.tool_for = target
+        names = [n for _, n in self.tool_list()]
+        current = self.current_tool()
+        self.tool_sel, self.tool_top = (names.index(current) if current in names else 0), 0
+        self.go("proton_pick")
+
+    def choose_tool(self):
+        name = self.tool_list()[self.tool_sel][1]
+        if self.tool_for[0] == "game":
+            self.screen = "game"
+            if name != self.current_tool():
+                self.change_game(lambda g: g.update(proton=name))
+            else:
+                self.draw()
+        else:
+            if name == COMPAT_TOOL[1]:
+                self.cfg.pop("proton", None)
+            else:
+                self.cfg["proton"] = name
+            save_config(self.cfg)
+            self.go("settings")
+
+    def tap_tool(self, i):
+        self.tool_sel = i
+        self.choose_tool()
+
     # settings actions ----------------------------------------------------------------
-    def action_menu(self):
-        if self.screen in ("library", "offline"):
-            self.draft, self.set_sel, self.busy = [dict(s) for s in self.cfg["sources"]], 0, ""
+    def open_settings(self):
+        if self.screen in ("library", "offline", "connecting"):
+            self.draft, self.set_sel, self.set_top, self.busy = [dict(s) for s in self.cfg["sources"]], 0, 0, ""
             self.go("settings")
 
     def finish_settings(self):
@@ -2515,24 +3452,34 @@ class App:
             self.go("library" if self.connected else "offline")
             return
         self.disconnect_all()
-        self.cfg = {"sources": complete}
+        self.cfg = dict(self.cfg, sources=complete)
         save_config(self.cfg)
         self.games, self.marked = [], set()
         self.go("connecting")
         self.connect()
 
-    def tap_row_in_list(self, i):
-        if self.screen == "settings":
-            self.set_sel = max(0, self.set_sel - 4) + i
-        else:
-            self.edit_sel = i
+    def tap_setting(self, k):
+        self.set_sel = k
+        self.action_a()
+
+    def tap_edit_row(self, i):
+        self.edit_sel = i
         self.action_a()
 
     def tap_pick(self, i):
-        if i == self.pick_sel:
+        if i == self.pick_sel or self.screen == "pick_type":
+            self.pick_sel = i
             self.action_a()
         else:
             self.pick_sel = i
+            self.draw()
+
+    def refresh_protondb(self):
+        if not self.protondb_job:
+            try:
+                self.protondb_job = start_protondb_update(force=True)
+            except OSError:
+                self.protondb_job = None
             self.draw()
 
     def load_pick(self, screen, work):
@@ -2561,8 +3508,7 @@ class App:
                 base = os.path.join(root, path)
                 names = sorted((n for n in os.listdir(base)
                                 if not n.startswith(".") and os.path.isdir(os.path.join(base, n))), key=str.lower)
-            up = [("..   (up a level)", None)] if path else []
-            return up + [(n, n) for n in names]
+            return [(n, n) for n in names]
         self.load_pick("pick_folder", folders)
 
     def edit_change(self):
@@ -2597,63 +3543,61 @@ class App:
         self.screen = screen
         self.draw()
 
-    def tap_row(self, i):
-        if i == self.selected:
+    def tap_exe(self, i):
+        if i == self.exe_sel:
             self.action_a()
         else:
-            self.selected = i
+            self.exe_sel = i
             self.draw()
 
-    def toggle_mark(self, i=None):
-        i = self.selected if i is None else i
-        if not self.games:
+    @staticmethod
+    def scrolled(sel, top, visible):
+        return sel if sel < top else sel - visible + 1 if sel >= top + visible else top
+
+    def move(self, dx, dy):
+        s = self.screen
+        if s in ("library", "offline") and self.shown:
+            cols, rows = self.grid_geometry()[:2]
+            n = len(self.shown)
+            if dx:
+                self.sel = max(0, min(n - 1, self.sel + dx))
+            elif 0 <= self.sel + dy * cols < n:
+                self.sel += dy * cols
+            elif dy > 0 and self.sel // cols < (n - 1) // cols:
+                self.sel = n - 1
+            row = self.sel // cols
+            self.top = self.scrolled(row, self.top, rows)
+        elif s == "details":
+            self.detail_sel = max(0, min(1, self.detail_sel + dx))
+        elif s == "game" and dy:
+            self.game_sel = max(0, min(len(self.game_rows()), self.game_sel + dy))
+        elif s == "proton_pick" and dy:
+            self.tool_sel = max(0, min(len(self.tool_list()) - 1, self.tool_sel + dy))
+        elif s == "settings":
+            items, cards = self.settings_items(), len(self.draft) + 1
+            if dx > 0 and self.set_sel < cards:
+                self.set_sel = cards
+            elif dx < 0 and self.set_sel >= cards:
+                self.set_sel = self.set_top
+            elif dy:
+                self.set_sel = max(0, min(len(items) - 1, self.set_sel + dy))
+        elif s == "pick_type":
+            self.pick_sel = max(0, min(1, self.pick_sel + (dx or dy)))
+        elif s == "edit_source" and dy:
+            self.edit_sel = max(0, min(len(self.edit_rows()) - 1, self.edit_sel + dy))
+        elif s in ("pick_share", "pick_drive", "pick_folder") and self.pick and dy:
+            self.pick_sel = max(0, min(len(self.pick) - 1, self.pick_sel + dy))
+            self.pick_top = self.scrolled(self.pick_sel, self.pick_top, self.pick_rows)
+        elif s == "pick_exe" and self.exes and dy:
+            self.exe_sel = max(0, min(len(self.exes) - 1, self.exe_sel + dy))
+            self.exe_top = self.scrolled(self.exe_sel, self.exe_top, int((716 - 262) // 72))
+        else:
             return
-        g = self.games[i]
-        if g["slug"] in self.marked:
-            self.marked.discard(g["slug"])
-        elif self.row_kind(g) == "install":
-            self.marked.add(g["slug"])
         self.draw()
-
-    def tap_exe(self, i):
-        self.exe_sel = i
-        self.draw()
-
-    def move(self, step):
-        if self.screen == "game":
-            self.game_sel = max(0, min(len(self.game_rows()) - 1, self.game_sel + step))
-            self.draw()
-        elif self.screen == "settings":
-            self.set_sel = max(0, min(len(self.draft), self.set_sel + step))
-            self.draw()
-        elif self.screen == "edit_source":
-            self.edit_sel = max(0, min(len(self.edit_rows()) - 1, self.edit_sel + step))
-            self.draw()
-        elif self.screen in ("pick_type", "pick_share", "pick_drive", "pick_folder") and self.pick:
-            self.pick_sel = max(0, min(len(self.pick) - 1, self.pick_sel + step))
-            if self.pick_sel < self.pick_top:
-                self.pick_top = self.pick_sel
-            elif self.pick_sel >= self.pick_top + 5:
-                self.pick_top = self.pick_sel - 4
-            self.draw()
-        elif self.screen == "library" and self.games:
-            self.selected = max(0, min(len(self.games) - 1, self.selected + step))
-            if self.selected < self.top:
-                self.top = self.selected
-            elif self.selected >= self.top + VISIBLE_ROWS:
-                self.top = self.selected - VISIBLE_ROWS + 1
-            self.draw()
-        elif self.screen == "pick_exe" and self.exes:
-            self.exe_sel = max(0, min(len(self.exes) - 1, self.exe_sel + step))
-            if self.exe_sel < self.exe_top:
-                self.exe_top = self.exe_sel
-            elif self.exe_sel >= self.exe_top + 5:
-                self.exe_top = self.exe_sel - 4
-            self.draw()
 
     def start_queue(self, games):
         self.queue, self.queue_total, self.queue_done, self.failed = list(games), len(games), 0, []
-        self.marked = set()
+        self.marked -= {g["slug"] for g in games}
         self.next_install()
 
     def next_install(self):
@@ -2661,6 +3605,7 @@ class App:
         if self.queue:
             self.current = self.queue.pop(0)
             self.stop_armed_until = 0
+            self.install_started = time.monotonic()
             self.job = InstallJob(self.current, self.events)
             self.job.start()
             self.go("installing")
@@ -2681,18 +3626,38 @@ class App:
 
     def action_a(self):
         s = self.screen
-        if s == "game":
-            self.game_change()
+        if s in ("library", "offline"):
+            if s == "offline" and not self.cfg["sources"]:
+                self.open_settings()
+            else:
+                self.open_entry()
+        elif s == "details":
+            if self.detail_sel == 0:
+                self.install_detail()
+            else:
+                self.toggle_slug(self.detail_slug)
+        elif s == "game":
+            if self.game_sel == 0:
+                self.main_action()
+            else:
+                self.game_change()
+        elif s == "proton_pick":
+            self.choose_tool()
         elif s == "game_log":
             self.go("game")
         elif s == "settings":
-            if self.set_sel < len(self.draft):
-                self.edit_idx, self.edit_sel = self.set_sel, 0
+            item = self.settings_items()[self.set_sel]
+            if item[0] == "source":
+                self.edit_idx, self.edit_sel = item[1], 0
                 self.go("edit_source")
-            else:
+            elif item[0] == "add":
                 self.pick, self.pick_values = ["SMB share", "USB drive or SD card"], ["smb", "usb"]
                 self.pick_sel, self.pick_top, self.busy = 0, 0, ""
                 self.go("pick_type")
+            elif item[0] == "proton":
+                self.open_tool_pick(("default",))
+            elif item[0] == "protondb":
+                self.refresh_protondb()
         elif s == "edit_source":
             self.edit_change()
         elif s == "pick_type":
@@ -2721,38 +3686,26 @@ class App:
             elif not self.busy:
                 self.edit_change()
         elif s == "pick_folder":
-            if self.pick:
-                name = self.pick_values[self.pick_sel]
-                self.open_folder(os.path.dirname(self.browse_path) if name is None
-                                 else f"{self.browse_path}/{name}".strip("/"))
-        elif s == "library":
-            if self.marked:
-                self.start_queue([g for g in self.games if g["slug"] in self.marked])
-            elif self.games and self.row_kind(self.games[self.selected]) == "install":
-                self.start_queue([self.games[self.selected]])
-            elif self.games and self.row_kind(self.games[self.selected]) in ("added", "installed"):
-                self.open_game(self.games[self.selected]["slug"])
+            if self.pick and not self.busy:
+                self.open_folder(f"{self.browse_path}/{self.pick_values[self.pick_sel]}".strip("/"))
         elif s == "add_to_steam":
             start_apply_steam()
             self.quit()
-        elif s == "offline":
-            if not self.cfg["sources"]:
-                self.action_menu()
-            else:
-                self.go("connecting")
-                self.connect()
         elif s == "failed":
             self.start_queue(self.failed)
         elif s == "pick_exe":
             exe = self.exes[self.exe_sel]
             record_install(self.state, self.current,
-                           {"exe": exe, "workdir": os.path.dirname(exe), "args": "", "root": os.path.dirname(exe)})
+                           {"exe": exe, "workdir": os.path.dirname(exe), "args": "", "root": os.path.dirname(exe)},
+                           self.cfg.get("proton"))
             self.install_finished()
 
     def action_b(self):
         s = self.screen
-        if s == "game":
-            self.go("library")
+        if s in ("details", "game"):
+            self.go("library" if self.connected else "offline")
+        elif s == "proton_pick":
+            self.go("game" if self.tool_for[0] == "game" else "settings")
         elif s == "game_log":
             self.go("game")
         elif s == "settings":
@@ -2762,45 +3715,68 @@ class App:
         elif s in ("edit_field", "pick_share", "pick_drive"):
             self.go("edit_source")
         elif s == "pick_folder":
-            if not self.busy:  # B accepts the folder being shown
-                self.draft[self.edit_idx]["folder"] = self.browse_path
+            if self.browse_path:
+                self.open_folder(os.path.dirname(self.browse_path))
+            else:
                 self.go("edit_source")
         elif s == "library" and self.marked:
             self.marked = set()
             self.draw()
-        elif s == "library" or s == "offline":
+        elif s in ("library", "offline", "connecting"):
             self.quit()
-        elif s == "add_to_steam":
-            self.go("library")
-        elif s == "failed":
-            self.go("library")
+        elif s in ("add_to_steam", "failed"):
+            self.go("library" if self.connected else "offline")
         elif s == "installing":
             # a stray press must not end a long install, so stopping takes two presses
             if time.monotonic() < self.stop_armed_until:
                 self.job.stop()
             else:
                 self.stop_armed_until = time.monotonic() + 4
-                self.root.after(4100, lambda: self.screen == "installing" and self.draw())
             self.draw()
         elif s == "pick_exe":
             discard_prefix(self.current["slug"], self.state)
             self.install_finished()
 
     def action_x(self):
-        if self.screen == "library":
+        s = self.screen
+        if s == "library":
             self.toggle_mark()
-        elif self.screen == "settings" and self.set_sel < len(self.draft):
+        elif s == "details":
+            self.toggle_slug(self.detail_slug)
+        elif s == "settings" and self.settings_items()[self.set_sel][0] == "source":
             del self.draft[self.set_sel]
             self.set_sel = min(self.set_sel, len(self.draft))
             self.draw()
-        elif self.screen == "edit_source":
+        elif s == "edit_source":
             del self.draft[self.edit_idx]
             self.set_sel = min(self.edit_idx, len(self.draft))
             self.go("settings")
+        elif s == "installing" and self.queue:
+            self.queue_total -= len(self.queue)
+            self.queue = []
+            self.draw()
+        elif s == "game_log":
+            self.change_game(lambda g: g.update(log=not g.get("log")))
 
     def action_y(self):
-        if self.screen in ("library", "game") and self.pending_count():
+        if self.screen in ("library", "offline", "details", "game") and self.pending_count():
             self.go("add_to_steam")
+        elif self.screen == "pick_folder" and not self.busy:
+            self.draft[self.edit_idx]["folder"] = self.browse_path
+            self.go("edit_source")
+
+    def action_menu(self):
+        """Start: installs the picked games; offline it tries the sources again; otherwise it opens Settings."""
+        if self.screen == "library" and self.marked:
+            self.start_queue([g for g in self.games if g["slug"] in self.marked])
+        elif self.screen == "offline" and self.cfg["sources"]:
+            self.go("connecting")
+            self.connect()
+        else:
+            self.open_settings()
+
+    def action_view(self):
+        self.open_settings()
 
     def quit(self):
         if self.job and self.job.is_alive():
@@ -2810,13 +3786,19 @@ class App:
         self.root.destroy()
 
     def bind_keys(self):
-        self.root.bind("<Up>", lambda e: self.move(-1))
-        self.root.bind("<Down>", lambda e: self.move(1))
+        self.root.bind("<Up>", lambda e: self.move(0, -1))
+        self.root.bind("<Down>", lambda e: self.move(0, 1))
+        self.root.bind("<Left>", lambda e: self.move(-1, 0))
+        self.root.bind("<Right>", lambda e: self.move(1, 0))
+        self.root.bind("<Prior>", lambda e: self.switch_tab(-1))
+        self.root.bind("<Next>", lambda e: self.switch_tab(1))
+        self.root.bind("<Tab>", lambda e: self.action_view())
         self.root.bind("<Return>", lambda e: self.action_a())
         self.root.bind("<Escape>", lambda e: self.action_b())
         # letters go to the text field while it's open, so these only act elsewhere
         self.root.bind("x", lambda e: self.on_key(e) if self.screen == "edit_field" else self.action_x())
         self.root.bind("y", lambda e: self.on_key(e) if self.screen == "edit_field" else self.action_y())
+        self.root.bind("m", lambda e: self.on_key(e) if self.screen == "edit_field" else self.action_menu())
         self.root.bind("<Key>", self.on_key, add="+")
 
     def on_click(self, e):
@@ -2828,22 +3810,50 @@ class App:
 
     def tick(self):
         for action in self.pad.poll():
-            {"up": lambda: self.move(-1), "down": lambda: self.move(1), "a": self.action_a,
-             "b": self.action_b, "x": self.action_x, "y": self.action_y, "menu": self.action_menu}[action]()
+            {"up": lambda: self.move(0, -1), "down": lambda: self.move(0, 1),
+             "left": lambda: self.move(-1, 0), "right": lambda: self.move(1, 0),
+             "l1": lambda: self.switch_tab(-1), "r1": lambda: self.switch_tab(1),
+             "a": self.action_a, "b": self.action_b, "x": self.action_x, "y": self.action_y,
+             "menu": self.action_menu, "view": self.action_view}[action]()
         try:
             while True:
                 self.on_event(self.events.get_nowait())
         except queue.Empty:
             pass
+        if self.protondb_job and self.protondb_job.poll() is not None:
+            self.protondb_job = None
+            self.dirty = self.dirty or self.screen == "settings"
+        now = time.monotonic()
+        if self.screen == "installing" and now - self.last_draw > 0.25:
+            self.dirty = True  # time so far and the moving bar
+        if self.screen == "installing" and self.stop_armed_until and now > self.stop_armed_until:
+            self.stop_armed_until = 0
+            self.dirty = True
+        if self.dirty:
+            self.draw()
         self.root.after(16, self.tick)
 
     def on_event(self, ev):
         kind = ev[0]
         if kind == "games":
-            self.games, self.source_errors, self.connected = ev[1], ev[2], ev[3]
-            self.selected = self.top = 0
-            self.go("library" if self.connected else "offline")
+            self.games, self.source_errors, self.connected, self.source_counts = ev[1], ev[2], ev[3], ev[4]
+            self.sel = self.top = 0
+            if self.screen == "connecting":
+                self.go("library" if self.connected else "offline")
             threading.Thread(target=self.lookup_sizes, args=(self.games,), daemon=True).start()
+        elif kind == "cover":
+            slug, size, path = ev[1], ev[2], ev[3]
+            if path:
+                try:
+                    self.images[(slug, size)] = self.tk.PhotoImage(file=path)
+                except self.tk.TclError:
+                    self.images[(slug, size)] = False
+            elif slug in self.cover_retry:  # GOG's data came in meanwhile: look again with it
+                self.cover_retry.discard(slug)
+                self.cover_jobs.discard((slug, size))
+            else:
+                self.images[(slug, size)] = False
+            self.dirty = True
         elif kind == "gameinfo":
             if ev[1] == self.game_slug:
                 self.game_info = ev[2]
@@ -2851,8 +3861,12 @@ class App:
                 if g is not None and g.get("steam_appid") is None and "steam_appid" in ev[2]:
                     g["steam_appid"] = ev[2]["steam_appid"]
                     save_state(self.state)
-                if self.screen in ("game", "game_log"):
-                    self.draw()
+                if self.screen in ("game", "game_log", "proton_pick"):
+                    self.dirty = True
+        elif kind == "detailinfo":
+            if ev[1] == self.detail_slug:
+                self.detail_info = ev[2]
+                self.dirty = self.dirty or self.screen == "details"
         elif kind == "pick":
             if self.screen == ev[1]:
                 self.pick, self.pick_values, self.busy = [p[0] for p in ev[2]], [p[1] for p in ev[2]], ""
@@ -2860,9 +3874,15 @@ class App:
         elif kind == "lookup":
             g = next((x for x in self.games if x["slug"] == ev[1]), None)
             if g:
+                had = cover_urls(g)
                 apply_lookup(g, ev[2])
-                if self.screen == "library":
-                    self.draw()
+                if cover_urls(g) != had:
+                    self.cover_retry.add(g["slug"])
+                    for key in [k for k, img in self.images.items() if k[0] == g["slug"] and img is False]:
+                        del self.images[key]
+                        self.cover_jobs.discard(key)
+                if self.screen in ("library", "details"):
+                    self.dirty = True
         elif kind == "stopped":
             discard_prefix(self.current["slug"], self.state)
             self.queue, self.queue_total = [], 0
@@ -2874,10 +3894,13 @@ class App:
         elif kind == "done":
             task, exes = ev[1], ev[2]
             if task:
-                record_install(self.state, self.current, task)
+                record_install(self.state, self.current, task, self.cfg.get("proton"))
                 self.install_finished()
             elif exes:
                 self.exes, self.exe_sel, self.exe_top = exes, 0, 0
+                self.exe_sizes = [os.path.getsize(p) if os.path.exists(p) else -1 for p in exes]
+                self.exe_sel = self.exe_likely = likely_exe(exes)
+                self.exe_top = self.scrolled(self.exe_sel, 0, int((716 - 262) // 72))
                 self.go("pick_exe")
             else:
                 self.message = "The installer closed before the game was installed."

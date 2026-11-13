@@ -2,6 +2,8 @@
 
 Installs your GOG installer backups on the Steam Deck and adds the games to Steam.
 
+![The library: a grid of covers with a badge for each game's state](docs/screenshots/library.png)
+
 ## Install
 
 ```bash
@@ -18,14 +20,32 @@ ssh deck@steamdeck.local 'systemd-run --user --collect python3 ~/.local/share/go
 
 Keep one folder per game, with its `setup_*.exe` and `.bin` files inside.
 
-- **SMB share:** Press **Start** in the app for Settings: switch the source to SMB, enter the server, then pick a guest share and folder with the gamepad.
-- **USB drive or SD card:** Press **Start** in the app for Settings: switch the source to USB, then pick the drive and folder with the gamepad.
+Press **View** (or **Start**) in the app for Settings, then **Add a source**:
+
+- **Network share:** enter the server, then pick a guest SMB share and folder with the gamepad.
+- **USB drive or SD card:** pick the drive and folder with the gamepad.
+
+![Settings: sources and Proton defaults](docs/screenshots/settings.png)
 
 ## Use
 
-- **A** installs the selected game. **X** selects several to install one after another.
+The library is a grid of covers. A badge on each says where it stands: not installed, installed, or in Steam.
+**L1** and **R1** switch between All, Not installed and Installed.
+
+- **A** opens a game. On a game that isn't installed, **A** installs it.
+- **X** picks several games; **Start** installs them one after another.
 - **Y** adds installed games to Steam. Steam restarts once.
-- **A** on an installed game opens its options: Proton version, fixes, and a log for the next launch. **Y** applies them.
+- On an installed game, **A** plays it through Steam. Below are its Proton version, fixes, and a log for the next launch; **Y** applies changes.
+- Everything can also be tapped.
+
+Covers come from Steam and GOG and are kept in `~/.cache/gog-installer/covers`. Until a cover is there, the game shows as a coloured tile with its title, as in these screenshots.
+
+<p>
+  <img src="docs/screenshots/details.png" alt="A game that isn't installed: sizes, ProtonDB rating, Install" width="49%">
+  <img src="docs/screenshots/installed.png" alt="An installed game: Play and its Proton settings" width="49%">
+</p>
+
+![Installing, with the rest of the queue](docs/screenshots/installing.png)
 
 ## Credits
 
