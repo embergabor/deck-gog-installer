@@ -38,7 +38,7 @@ The library is a grid of covers. A badge on each says where it stands: not insta
 - On an installed game, **A** plays it through Steam. Below are its Proton version, fixes, and a log for the next launch; **Y** applies changes.
 - Everything can also be tapped.
 
-Covers come from Steam and GOG and are kept in `~/.cache/gog-installer/covers`. Until a cover is there, the game shows as a coloured tile with its title, as in these screenshots.
+Covers come from Steam and GOG and are kept in `~/.cache/gog-installer/covers`. Until a cover is there, the game shows as a coloured tile with its title.
 
 <p>
   <img src="docs/screenshots/details.png" alt="A game that isn't installed: sizes, ProtonDB rating, Install" width="49%">
