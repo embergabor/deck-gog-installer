@@ -13,8 +13,10 @@ On the Steam Deck, in Desktop Mode:
 3. Choose **Yes**. The app is installed, and Steam closes and reopens with **GOG Backup Installer** in your
    library under Non-Steam.
 
-Switch back to Game Mode and start it from there. To update, run a newer installer the same way; your sources
-and installed games stay.
+Switch back to Game Mode and start it from there.
+
+The app updates itself. When a new version is out, an **Update** button shows at the top of the library and in
+Settings; press it and the app restarts on the new version. Your sources, games and settings stay.
 
 ## Sources
 

@@ -977,5 +977,93 @@ class Installer(unittest.TestCase):
                 self.assertEqual(f.read(), orig.read())
 
 
+class Updates(unittest.TestCase):
+    """The app updating itself from the latest GitHub release."""
+
+    def release(self, tag, assets=("GOG-Backup-Installer.desktop", "GOG-Backup-Installer.desktop.sha256")):
+        return {"tag_name": tag, "body": "## What's new\n- **Covers**", "assets": [
+            {"name": a, "browser_download_url": f"https://github.com/x/releases/download/{tag}/{a}"} for a in assets]}
+
+    def test_versions(self):
+        self.assertEqual(g.release_version("v0.2.0"), (0, 2, 0))
+        self.assertEqual(g.release_version("1.10"), (1, 10))
+        self.assertIsNone(g.release_version("dev"))
+        self.assertIsNone(g.release_version("v2-beta"))
+
+    def test_only_newer_releases_with_a_checksum(self):
+        info = g.newer_release(self.release("v0.2.0"), "0.1.0")
+        self.assertEqual(info["version"], "0.2.0")
+        self.assertTrue(info["sha256_url"].endswith(".sha256"))
+        self.assertIsNone(g.newer_release(self.release("v0.1.0"), "0.1.0"))
+        self.assertIsNone(g.newer_release(self.release("v0.0.9"), "0.1.0"))
+        self.assertIsNone(g.newer_release(self.release("v0.2.0", ["GOG-Backup-Installer.desktop"]), "0.1.0"))
+        self.assertIsNone(g.newer_release(self.release("v9.0.0"), "dev"))  # a copy from the repo never updates
+
+    def build(self, d, version):
+        import make_installer
+        path = make_installer.build(f"{d}/dist/GOG-Backup-Installer.desktop", version)
+        with open(path, "rb") as f, open(path + ".sha256", "rb") as s:
+            return f.read(), s.read()
+
+    def test_update_replaces_the_app_and_keeps_the_rest(self):
+        with tempfile.TemporaryDirectory() as d:
+            blob, sha = self.build(d, "0.2.0")
+            app, fonts = f"{d}/app", f"{d}/fonts"
+            os.makedirs(app)
+            for name, text in (("gog_installer.py", "old app"), ("state.json", '{"games": {}}')):
+                with open(f"{app}/{name}", "w") as f:
+                    f.write(text)
+            info = g.newer_release(self.release("v0.2.0"), "0.1.0")
+            urls = {info["url"]: blob, info["sha256_url"]: sha}
+            with mock.patch.object(g, "http_get", side_effect=lambda url: urls[url]), \
+                    mock.patch.object(g.subprocess, "run"):
+                self.assertEqual(g.apply_update(info, app, fonts), "0.2.0")
+            with open(f"{app}/gog_installer.py") as f:
+                self.assertIn('VERSION = "0.2.0"', f.read())
+            with open(f"{app}/.previous/gog_installer.py") as f:
+                self.assertEqual(f.read(), "old app")
+            with open(f"{app}/state.json") as f:
+                self.assertEqual(f.read(), '{"games": {}}')
+            self.assertTrue(os.access(f"{app}/gog-installer.sh", os.X_OK))
+            self.assertTrue(os.path.exists(f"{fonts}/BarlowSemiCondensed-Regular.ttf"))
+            self.assertEqual([n for n in os.listdir(app) if n.endswith(".new")], [])
+
+    def test_wrong_checksum_changes_nothing(self):
+        with tempfile.TemporaryDirectory() as d:
+            blob, _ = self.build(d, "0.2.0")
+            app = f"{d}/app"
+            os.makedirs(app)
+            with open(f"{app}/gog_installer.py", "w") as f:
+                f.write("old app")
+            info = g.newer_release(self.release("v0.2.0"), "0.1.0")
+            urls = {info["url"]: blob, info["sha256_url"]: b"0" * 64 + b"  GOG-Backup-Installer.desktop\n"}
+            with mock.patch.object(g, "http_get", side_effect=lambda url: urls[url]):
+                with self.assertRaises(ValueError):
+                    g.apply_update(info, app, f"{d}/fonts")
+            self.assertEqual(os.listdir(app), ["gog_installer.py"])
+            with open(f"{app}/gog_installer.py") as f:
+                self.assertEqual(f.read(), "old app")
+
+    def test_payload_refuses_paths_outside_the_app(self):
+        import base64, io, tarfile
+        for bad in ("app/../../.bashrc", "other/x", "app/sub/x", "app/.hidden"):
+            buf = io.BytesIO()
+            with tarfile.open(fileobj=buf, mode="w:gz") as tar:
+                for name in ("app/gog_installer.py", bad):
+                    info = tarfile.TarInfo(name)
+                    info.size = 1
+                    tar.addfile(info, io.BytesIO(b"x"))
+            text = "".join(f"#= {line}\n" for line in base64.encodebytes(buf.getvalue()).decode().split())
+            with self.assertRaises(ValueError, msg=bad):
+                g.installer_payload(text)
+
+    def test_builds_without_a_version_stay_dev(self):
+        import make_installer
+        with open(g.__file__, "rb") as f:
+            source = f.read()
+        self.assertIn(b'VERSION = "dev"', source)
+        self.assertIn(b'VERSION = "1.2.3"', make_installer.stamped(source, "1.2.3"))
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -9,7 +9,7 @@ SMB guest share or a USB drive / SD card, runs the chosen `setup_*.exe` under Pr
 - `gog_installer.py`: the whole app, one file. Sections are marked `# --- name ---`, in this order: config and
   state, SMB guest shares (`SmbFs`), USB drives, sources, installer parsing and title lookup, GOG's public data,
   running an installer (`InstallJob`), Steam `shortcuts.vdf`, artwork, per-game fixes and ProtonDB, GOG's
-  DDrawCompat patch, gamepad (`Gamepad`), UI (cover helpers, then `App`), `main()`.
+  DDrawCompat patch, updates, gamepad (`Gamepad`), UI (cover helpers, then `App`), `main()`.
 - The UI is one Tk canvas laid out at 1280×800 and scaled; `draw_<screen>` draws each screen, `self.hits`
   holds tap targets, and `action_a/b/x/y/menu/view` and `move(dx, dy)` handle the gamepad. The library is
   a cover grid (`library_entries`, `entries`, `view`); installed games without a source still show.
@@ -27,8 +27,11 @@ SMB guest share or a USB drive / SD card, runs the chosen `setup_*.exe` under Pr
 
 ```bash
 python3 -m unittest test_gog_installer          # all tests; run after every change
-python3 make_installer.py                        # dist/GOG-Backup-Installer.desktop, the release asset
+python3 make_installer.py 0.2.0                  # dist/GOG-Backup-Installer.desktop and its .sha256
+gh release create v0.2.0 dist/GOG-Backup-Installer.desktop dist/GOG-Backup-Installer.desktop.sha256
 ```
+
+A release is how users get a new version: the app checks GitHub's latest release at start and offers it.
 
 To try a build on the Deck, copy the `.desktop` file there and double-click it in Desktop Mode, or run
 `./install.sh` from a copy of the repo on the Deck.
@@ -58,6 +61,12 @@ own `/usr/bin/python3`: its Tk 8.5 crashes on current macOS.
 - **Covers:** Tk reads only PNG/GIF and can't scale, so `cover_thumbnail` wraps a JPEG/PNG in an SVG and
   runs `rsvg-convert` (shipped with SteamOS) to a PNG at the exact size, cached under `COVERS`. Covers load
   on one worker thread and reach the UI as `("cover", …)` events; never touch Tk off the UI thread.
+- **Updates:** `VERSION` is `"dev"` in the repo; `make_installer.py` writes the release's version into the copy it
+  packs, and a `"dev"` copy never updates. The app takes a release only if its tag is newer and it has both the
+  `.desktop` and its `.sha256`. `apply_update` checks the hash, accepts only plain `app/` and `fonts/` files,
+  writes everything as `.new` before replacing, keeps the old files in `.previous`, and never touches state,
+  config or logs. Then the app re-execs itself in the same process, so Steam still tracks it. Tag releases
+  `vX.Y.Z` and always upload both files.
 - **Play** goes through Steam (`play_url`: the shortcut's app id << 32 | 0x02000000), never by running the exe.
 - **ctypes layouts assume x86_64 glibc** (`STAT_SIZE`, `DIRENT_NAME`, `struct fuse_operations` of libfuse 2.9).
 - **Network lookups** (GOG catalogue, gogdb.org, Steam store, ProtonDB export) are cached in `DATA`; tests must

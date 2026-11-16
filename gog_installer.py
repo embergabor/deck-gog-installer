@@ -10,6 +10,8 @@ Usage: gog_installer.py                 run the app
        gog_installer.py --apply-steam   add pending games to Steam (restarts Steam)
        gog_installer.py --fetch-art     download missing artwork; Steam shows it after its next restart
        gog_installer.py --update-protondb [--force]   refresh ProtonDB fix suggestions (monthly export)
+       gog_installer.py --update        install the latest release from GitHub, if it's newer
+       gog_installer.py --version       print this copy's version
        gog_installer.py --smbfs URL DIR mount a guest SMB folder read-only (the app starts this itself)
 """
 import base64
@@ -17,7 +19,9 @@ import binascii
 import codecs
 import errno
 import glob
+import hashlib
 import html
+import io
 import json
 import os
 import queue
@@ -1841,6 +1845,85 @@ def start_apply_steam():
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+# --- updates -----------------------------------------------------------------------------
+# Each version is a GitHub release with GOG-Backup-Installer.desktop, the file people install from, and its
+# SHA-256. The app checks the latest release and, when asked, swaps its own files for the release's, keeping the
+# old ones in .previous. Settings, state and logs beside it stay; Steam's shortcut runs gog-installer.sh, so
+# Steam doesn't need a restart.
+
+VERSION = "dev"  # make_installer.py writes the release's version here; a copy run from the repo never updates
+RELEASES = "https://api.github.com/repos/embergabor/deck-gog-installer/releases/latest"
+INSTALLER_NAME = "GOG-Backup-Installer.desktop"
+FONT_DIR = f"{HOME}/.local/share/fonts/gog-installer"
+
+
+def release_version(tag):
+    """"v0.2.0" -> (0, 2, 0); None for anything that isn't a version, such as "dev"."""
+    m = re.fullmatch(r"v?(\d+(?:\.\d+)*)", (tag or "").strip())
+    return tuple(int(x) for x in m.group(1).split(".")) if m else None
+
+
+def newer_release(release, current=None):
+    """{"version", "url", "sha256_url", "notes"} when a GitHub release is newer than this copy, else None."""
+    mine, theirs = release_version(current or VERSION), release_version(release.get("tag_name"))
+    if not mine or not theirs or theirs <= mine:
+        return None
+    assets = {a.get("name"): a.get("browser_download_url") for a in release.get("assets") or []}
+    if not assets.get(INSTALLER_NAME) or not assets.get(INSTALLER_NAME + ".sha256"):
+        return None
+    return {"version": ".".join(map(str, theirs)), "url": assets[INSTALLER_NAME],
+            "sha256_url": assets[INSTALLER_NAME + ".sha256"], "notes": release.get("body") or ""}
+
+
+def check_update():
+    return newer_release(decode_json(http_get(RELEASES)))
+
+
+def installer_payload(text):
+    """{"app/<name>" or "fonts/<name>": bytes} from an installer's "#= " lines. Anything else is refused."""
+    data = base64.b64decode("".join(l[3:] for l in text.splitlines() if l.startswith("#= ")), validate=True)
+    out = {}
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tar:
+        for m in tar.getmembers():
+            folder, _, name = m.name.partition("/")
+            if not m.isfile() or folder not in ("app", "fonts") or not name or "/" in name or name.startswith("."):
+                raise ValueError(f"unexpected file in the update: {m.name}")
+            out[m.name] = tar.extractfile(m).read()
+    if "app/gog_installer.py" not in out:
+        raise ValueError("the update has no app in it")
+    return out
+
+
+def apply_update(info, app_dir=APP_DIR, font_dir=FONT_DIR):
+    """Download, check and install an update; returns its version. Every file is written before any is
+    replaced, so a failed download or a wrong checksum leaves the app as it was."""
+    blob = http_get(info["url"])
+    want = http_get(info["sha256_url"]).decode("ascii", "replace").split()
+    if not want or hashlib.sha256(blob).hexdigest() != want[0].lower():
+        raise ValueError("the download doesn't match its checksum")
+    files = installer_payload(blob.decode("utf-8"))
+    staged = []
+    for path, data in files.items():
+        folder, name = path.split("/")
+        dest = os.path.join(app_dir if folder == "app" else font_dir, name)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        with open(dest + ".new", "wb") as f:
+            f.write(data)
+        os.chmod(dest + ".new", 0o755 if name.endswith(".sh") else 0o644)
+        staged.append((folder, dest))
+    backup = os.path.join(app_dir, ".previous")
+    os.makedirs(backup, exist_ok=True)
+    for folder, dest in staged:
+        if folder == "app" and os.path.exists(dest):
+            shutil.copy2(dest, os.path.join(backup, os.path.basename(dest)))
+        os.replace(dest + ".new", dest)
+    try:
+        subprocess.run(["fc-cache", "-f", font_dir], capture_output=True, timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return info["version"]
+
+
 # --- gamepad -----------------------------------------------------------------------------
 
 class Gamepad:
@@ -2107,6 +2190,8 @@ class App:
         self.game_slug, self.game_sel, self.game_top, self.game_info, self.tools = None, 0, 0, {}, None
         self.tool_for, self.tool_sel, self.tool_top = None, 0, 0
         self.protondb_job = None
+        self.update_info, self.update_error, self.update_back = None, "", "library"
+        self.update_state = "dev" if release_version(VERSION) is None else "checking"
         self.images, self.cover_jobs, self.cover_retry, self.cover_queue = {}, set(), set(), queue.Queue()
         threading.Thread(target=self.cover_worker, daemon=True).start()
         self.pad = Gamepad()
@@ -2115,6 +2200,8 @@ class App:
         self.draw()
         start_protondb_update()
         self.root.after(50, self.connect)
+        if self.update_state == "checking":
+            self.root.after(1500, self.check_for_update)
         self.root.after(16, self.tick)
 
     # drawing helpers -------------------------------------------------------------------
@@ -2507,9 +2594,16 @@ class App:
                 x += w + 26
             self.glyph(x + 8, 44, "R1", 36, DIM)
             self.hits.append((x - 10, 16, x + 26, 72, lambda: self.switch_tab(1)))
+            right = 1010
+            if self.update_info:
+                label = f"Update {self.update_info['version']}"
+                w = 10 + 18 + 8 + self.width_of(label, 18, True) + 14
+                self.chip(right - w, 44, label, "down", FOCUS, GROUND, 18)
+                self.hits.append((right - w, 22, right, 66, lambda: self.open_update("library")))
+                right -= w + 16
             if self.source_errors:
                 k = len(self.source_errors)
-                self.text(1010, 44, f"{k} source{'s' if k > 1 else ''} offline", 18, WARN, True, "e")
+                self.text(right, 44, f"{k} source{'s' if k > 1 else ''} offline", 18, WARN, True, "e")
         self.free_meter()
 
     def draw_grid(self, shown):
@@ -3040,7 +3134,7 @@ class App:
 
     # settings ------------------------------------------------------------------------
     def settings_items(self):
-        return [("source", i) for i in range(len(self.draft))] + [("add",), ("proton",), ("protondb",)]
+        return [("source", i) for i in range(len(self.draft))] + [("add",), ("proton",), ("protondb",), ("update",)]
 
     def draw_settings(self):
         self.top_bar(back=("Library", self.action_b), title="Settings", free=False)
@@ -3086,7 +3180,7 @@ class App:
             self.text(x1, 140, f"{self.set_top + 1}–{min(cards, self.set_top + visible)} of {cards}", 18, MUTED,
                       True, "e")
         px0, px1 = 844, 1224
-        self.panel(px0, 210, px1, 594)
+        self.panel(px0, 210, px1, 666)
         self.text(px0 + 24, 238, "On this Deck", 24, TEXT, True)
         free, total = free_space()
         self.text(px0 + 24, 276, f"{fmt_free(free)} free of {fmt_free(total)}", 20, TEXT)
@@ -3103,7 +3197,8 @@ class App:
         installed = self.state["games"].values()
         rows = [("proton", "Proton for new games", self.tool_label(self.cfg.get("proton")) + "  ›"),
                 ("protondb", "ProtonDB suggestions", updated + ("" if self.protondb_job else "  ›")),
-                (None, "Installed games", f"{len(installed)} · {fmt_size(sum(g.get('installed_size', 0) for g in installed))}")]
+                (None, "Installed games", f"{len(installed)} · {fmt_size(sum(g.get('installed_size', 0) for g in installed))}"),
+                ("update", "App version", self.version_line())]
         y = 322
         for kind, label, value in rows:
             k = next((i for i, it in enumerate(items) if it[0] == kind), None)
@@ -3120,8 +3215,11 @@ class App:
             y += 72
         self.text(px0 + 24, y + 22, "ProtonDB data export, ODbL.", 16, MUTED)
         item = items[self.set_sel]
-        a = {"source": "Edit", "add": "Add", "proton": "Change", "protondb": "Refresh"}[item[0]]
-        self.hints([("A", a, not (item[0] == "protondb" and self.protondb_job), self.action_a),
+        a = {"source": "Edit", "add": "Add", "proton": "Change", "protondb": "Refresh",
+             "update": "Update" if self.update_info else "Check for updates"}[item[0]]
+        busy = (item[0] == "protondb" and self.protondb_job) or \
+            (item[0] == "update" and self.update_state in ("dev", "checking", "busy"))
+        self.hints([("A", a, not busy, self.action_a),
                     ("X", "Remove", item[0] == "source", self.action_x),
                     ("B", "Done", True, self.action_b)])
 
@@ -3439,6 +3537,99 @@ class App:
         self.tool_sel = i
         self.choose_tool()
 
+    # updates -------------------------------------------------------------------------
+    def version_line(self):
+        v = VERSION
+        return {"dev": "Copy from the repo, not updated",
+                "checking": f"{v} · Checking for updates…",
+                "latest": f"{v} · Up to date  ›",
+                "unknown": f"{v} · Couldn’t check  ›",
+                "busy": f"{v} · Updating…",
+                "failed": f"{v} · Update failed  ›",
+                "available": f"{v} · {self.update_info['version'] if self.update_info else ''} is out  ›"}[
+            self.update_state]
+
+    def check_for_update(self):
+        self.update_state = "checking"
+
+        def work():
+            try:
+                self.events.put(("update", check_update(), ""))
+            except (OSError, ValueError, KeyError) as e:
+                self.events.put(("update", None, str(e)))
+        threading.Thread(target=work, daemon=True).start()
+        if self.screen in ("library", "settings"):
+            self.draw()
+
+    def open_update(self, back):
+        if self.update_info and not (self.job and self.job.is_alive()):
+            self.update_back = back
+            if self.update_state == "failed":
+                self.update_state = "available"
+            self.go("update")
+
+    def start_update(self):
+        info = dict(self.update_info)
+        self.update_state, self.update_error = "busy", ""
+
+        def work():
+            try:
+                apply_update(info)
+                self.events.put(("updated",))
+            except (OSError, ValueError, KeyError, tarfile.TarError, binascii.Error) as e:
+                self.events.put(("update_failed", str(e)))
+        threading.Thread(target=work, daemon=True).start()
+        self.draw()
+
+    def restart(self):
+        """Start the updated app in this same process, so Steam still sees the game it launched."""
+        self.disconnect_all()
+        self.root.destroy()
+        os.execv(sys.executable, [sys.executable, os.path.join(APP_DIR, "gog_installer.py")] + sys.argv[1:])
+
+    def release_notes(self):
+        """The release's notes as plain lines: Markdown marks taken out, list items as bullets."""
+        out = []
+        for line in (self.update_info or {}).get("notes", "").splitlines():
+            line = re.sub(r"\*\*|__|`", "", line.strip())
+            line = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", line)
+            if line.startswith("#"):
+                line = line.lstrip("#").strip()
+            elif line[:2] in ("- ", "* "):
+                line = "•  " + line[2:]
+            out.append(line)
+        while out and not out[-1]:
+            out.pop()
+        return out
+
+    def draw_update(self):
+        info = self.update_info or {"version": "?"}
+        self.top_bar(back=("Settings" if self.update_back == "settings" else "Library", self.action_b),
+                     title="Update", free=False)
+        self.text(56, 152, f"Version {info['version']} is out", 52, TEXT, True)
+        self.text(56, 200, f"You have {VERSION}. Your sources, installed games and settings stay as they are.",
+                  22, MUTED)
+        self.panel(56, 232, 1224, 562)
+        y, lines = 266, []
+        for line in self.release_notes():
+            lines += self.wrap(line, 21, False, 1100, 3) if line else [""]
+        for line in lines[:10]:
+            self.text(84, y, line, 21, TEXT)
+            y += 30
+        if len(lines) > 10:
+            self.text(84, y, "…", 21, MUTED)
+        y = 618
+        if self.update_state == "busy":
+            self.text(56, y + 34, "Downloading and installing… The app restarts when it’s done.", 26, TEXT, True)
+            self.hints([])
+            return
+        if self.update_state == "failed":
+            self.text(56, 584, self.fit(f"The update didn’t install: {self.update_error}", 20, False, 1168), 20, WARN)
+        label = "Try again" if self.update_state == "failed" else "Update and restart"
+        end = self.button(56, y, label, "A", self.action_a, primary=True, focused=True)
+        self.button(end + 24, y, "Not now", "B", self.action_b)
+        self.hints([("A", label, True, self.action_a), ("B", "Not now", True, self.action_b)])
+
     # settings actions ----------------------------------------------------------------
     def open_settings(self):
         if self.screen in ("library", "offline", "connecting"):
@@ -3658,6 +3849,11 @@ class App:
                 self.open_tool_pick(("default",))
             elif item[0] == "protondb":
                 self.refresh_protondb()
+            elif item[0] == "update":
+                if self.update_info:
+                    self.open_update("settings")
+                elif self.update_state not in ("dev", "checking", "busy"):
+                    self.check_for_update()
         elif s == "edit_source":
             self.edit_change()
         elif s == "pick_type":
@@ -3691,6 +3887,9 @@ class App:
         elif s == "add_to_steam":
             start_apply_steam()
             self.quit()
+        elif s == "update":
+            if self.update_state in ("available", "failed"):
+                self.start_update()
         elif s == "failed":
             self.start_queue(self.failed)
         elif s == "pick_exe":
@@ -3708,6 +3907,9 @@ class App:
             self.go("game" if self.tool_for[0] == "game" else "settings")
         elif s == "game_log":
             self.go("game")
+        elif s == "update":
+            if self.update_state != "busy":
+                self.go(self.update_back)
         elif s == "settings":
             self.finish_settings()
         elif s in ("edit_source", "pick_type"):
@@ -3863,6 +4065,15 @@ class App:
                     save_state(self.state)
                 if self.screen in ("game", "game_log", "proton_pick"):
                     self.dirty = True
+        elif kind == "update":
+            self.update_info, self.update_error = ev[1], ev[2]
+            self.update_state = "available" if ev[1] else ("unknown" if ev[2] else "latest")
+            self.dirty = self.dirty or self.screen in ("library", "settings", "update")
+        elif kind == "updated":
+            self.restart()
+        elif kind == "update_failed":
+            self.update_state, self.update_error = "failed", ev[1]
+            self.draw()
         elif kind == "detailinfo":
             if ev[1] == self.detail_slug:
                 self.detail_info = ev[2]
@@ -3917,6 +4128,11 @@ def main():
     elif "--smbfs" in sys.argv:
         url, mountpoint = sys.argv[sys.argv.index("--smbfs") + 1:][:2]
         sys.exit(SmbFs(url).run(mountpoint, urllib.parse.urlsplit(url).netloc))
+    elif "--version" in sys.argv:
+        print(VERSION)
+    elif "--update" in sys.argv:
+        info = check_update()
+        print(f"updated to {apply_update(info)}" if info else f"{VERSION} is the latest version")
     elif "--update-protondb" in sys.argv:
         update_protondb_index(force="--force" in sys.argv)
     elif "--fetch-art" in sys.argv:
