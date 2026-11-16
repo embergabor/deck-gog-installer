@@ -14,15 +14,24 @@ SMB guest share or a USB drive / SD card, runs the chosen `setup_*.exe` under Pr
   holds tap targets, and `action_a/b/x/y/menu/view` and `move(dx, dy)` handle the gamepad. The library is
   a cover grid (`library_entries`, `entries`, `view`); installed games without a source still show.
 - `test_gog_installer.py`: unit tests for everything that touches Steam's files or decides what gets installed.
-- `gog-installer.sh`: what the Steam shortcut starts. `install.sh`: copies the app and fonts to the Deck over SSH.
+- `gog-installer.sh`: what the Steam shortcut starts.
+- `install.sh`: installs on the Deck itself (app, fonts, a Desktop Mode menu entry) and adds the app to Steam
+  as a non-Steam game through `--apply-steam`; an update of an app already in Steam skips the restart.
+- `make_installer.py`: builds `dist/GOG-Backup-Installer.desktop`, the one file users download and double-click
+  in Desktop Mode. `install.sh` sits in its `#> ` lines and a tar.gz of the app in its `#= ` lines; `Exec` pipes
+  the file's own `#> ` lines to bash. Desktop entry escaping: `\\"` and `\\$` inside a quoted argument.
+  No SSH or terminal steps for users.
 - `cover.svg`, `wide.svg`: the app's own Steam artwork. `fonts/`: Barlow Semi Condensed (OFL).
 
 ## Commands
 
 ```bash
 python3 -m unittest test_gog_installer          # all tests; run after every change
-./install.sh [user@host]                         # copy to the Deck (default deck@steamdeck.local)
+python3 make_installer.py                        # dist/GOG-Backup-Installer.desktop, the release asset
 ```
+
+To try a build on the Deck, copy the `.desktop` file there and double-click it in Desktop Mode, or run
+`./install.sh` from a copy of the repo on the Deck.
 
 On the Deck: `gog_installer.py --list` prints what each source holds; `--apply-steam`, `--fetch-art` and
 `--update-protondb [--force]` are the other entry points (see the module docstring). `GOGI_WINDOWED=1` runs the

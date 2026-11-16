@@ -853,5 +853,129 @@ class Library(unittest.TestCase):
         self.assertNotIn("proton", state["games"]["c"])
 
 
+def desktop_exec(value, path):
+    """argv for a desktop entry's Exec value, as the freedesktop spec reads it: string escapes, then quoted
+    arguments, then %k. An escape the spec doesn't allow raises KeyError, as GLib refuses the file."""
+    import re
+    s = re.sub(r"\\(.)", lambda m: {"s": " ", "n": "\n", "t": "\t", "r": "\r", "\\": "\\"}[m.group(1)], value)
+    args, cur, quoted, started, i = [], "", False, False, 0
+    while i < len(s):
+        c = s[i]
+        if quoted and c == "\\" and s[i + 1] in '"`$\\':
+            cur, i = cur + s[i + 1], i + 2
+            continue
+        if c == '"':
+            quoted, started = not quoted, True
+        elif c == " " and not quoted:
+            if cur or started:
+                args.append(cur)
+            cur, started = "", False
+        else:
+            cur += c
+        i += 1
+    args.append(cur)
+    return [path if a == "%k" else a for a in args]
+
+
+class Installer(unittest.TestCase):
+    """The one-file Desktop Mode installer made by make_installer.py."""
+
+    @classmethod
+    def setUpClass(cls):
+        import make_installer
+        cls.mk = make_installer
+        cls.dir = tempfile.mkdtemp()
+        cls.path = make_installer.build(f"{cls.dir}/GOG-Backup-Installer.desktop")
+        with open(cls.path) as f:
+            cls.text = f.read()
+
+    def entry(self):
+        out = {}
+        for line in self.text.splitlines():
+            if "=" in line and not line.startswith("#") and not line.startswith("["):
+                k, v = line.split("=", 1)
+                out[k] = v
+        return out
+
+    def test_exec_reads_itself(self):
+        argv = desktop_exec(self.entry()["Exec"], "/home/deck/Downloads/GOG-Backup-Installer.desktop")
+        self.assertEqual(argv, ["bash", "-c", "sed -n 's/^#> //p' \"$0\" | bash -s -- \"$0\"",
+                                "/home/deck/Downloads/GOG-Backup-Installer.desktop"])
+
+    def test_script_and_app_inside(self):
+        import base64, io, tarfile
+        script = "\n".join(l[3:] for l in self.text.splitlines() if l.startswith("#> "))
+        with open(os.path.join(os.path.dirname(g.__file__), "install.sh")) as f:
+            self.assertEqual(script, f.read().rstrip("\n"))
+        data = base64.b64decode("".join(l[3:] for l in self.text.splitlines() if l.startswith("#= ")))
+        with tarfile.open(fileobj=io.BytesIO(data)) as tar:
+            names = tar.getnames()
+            app = tar.extractfile("app/gog_installer.py").read()
+        self.assertEqual(sorted(names), sorted([f"app/{n}" for n in self.mk.APP_FILES]
+                                               + [f"fonts/{n}" for n in self.mk.FONT_FILES]))
+        with open(g.__file__, "rb") as f:
+            self.assertEqual(app, f.read())
+
+    def run_launcher(self, home, answer):
+        """Runs the launcher the way the desktop does, with stand-ins for SteamOS's tools."""
+        import shutil, subprocess
+        if not shutil.which("bash"):
+            self.skipTest("needs bash")
+        bin_dir = f"{home}/bin"
+        os.makedirs(bin_dir)
+        fakes = {"kdialog": f'echo "kdialog $*" >> "{home}/calls"; [ "$3" != --yesno ] || exit {answer}',
+                 "systemd-run": f'echo "systemd-run $*" >> "{home}/calls"',
+                 "python3": 'exit 0'}
+        for name, body in fakes.items():
+            with open(f"{bin_dir}/{name}", "w") as f:
+                f.write(f"#!/bin/sh\n{body}\n")
+            os.chmod(f"{bin_dir}/{name}", 0o755)
+        argv = desktop_exec(self.entry()["Exec"], self.path)
+        env = {"HOME": home, "PATH": f"{bin_dir}:/usr/bin:/bin"}
+        r = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        with open(f"{home}/calls") as f:
+            return f.read()
+
+    def test_installs_and_adds_to_steam(self):
+        with tempfile.TemporaryDirectory() as home:
+            calls = self.run_launcher(home, 0)
+            app = f"{home}/.local/share/gog-installer"
+            with open(f"{app}/gog_installer.py", "rb") as f, open(g.__file__, "rb") as orig:
+                self.assertEqual(f.read(), orig.read())
+            self.assertTrue(os.access(f"{app}/gog-installer.sh", os.X_OK))
+            self.assertTrue(os.path.exists(f"{home}/.local/share/fonts/gog-installer/BarlowSemiCondensed-Bold.ttf"))
+            with open(f"{home}/.local/share/applications/gog-backup-installer.desktop") as f:
+                self.assertIn(f'Exec="{app}/gog-installer.sh"', f.read())
+            self.assertIn("--yesno", calls)
+            self.assertIn(f"python3 {app}/gog_installer.py --apply-steam", calls)
+
+    def test_cancel_changes_nothing(self):
+        with tempfile.TemporaryDirectory() as home:
+            calls = self.run_launcher(home, 1)
+            self.assertIn("add it to your Steam library", calls)  # asked once, up front
+            self.assertNotIn("systemd-run", calls)
+            self.assertFalse(os.path.exists(f"{home}/.local/share/gog-installer"))
+            self.assertFalse(os.path.exists(f"{home}/.local/share/applications"))
+
+    def test_update_keeps_data_and_doesnt_restart_steam(self):
+        with tempfile.TemporaryDirectory() as home:
+            app = f"{home}/.local/share/gog-installer"
+            grid = f"{home}/.local/share/Steam/userdata/42/config"
+            os.makedirs(app)
+            os.makedirs(grid)
+            for path, text in ((f"{app}/state.json", '{"games": {}}'), (f"{app}/gog_installer.py", "old"),
+                               (f"{grid}/shortcuts.vdf", "...gog-installer.sh...")):
+                with open(path, "w") as f:
+                    f.write(text)
+            calls = self.run_launcher(home, 0)
+            self.assertNotIn("--yesno", calls)
+            self.assertIn("updated", calls)
+            with open(f"{app}/state.json") as f:
+                self.assertEqual(f.read(), '{"games": {}}')
+            with open(f"{app}/gog_installer.py", "rb") as f, open(g.__file__, "rb") as orig:
+                self.assertEqual(f.read(), orig.read())
+
+
 if __name__ == "__main__":
     unittest.main()

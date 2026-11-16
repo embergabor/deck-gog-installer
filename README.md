@@ -6,15 +6,15 @@ Installs your GOG installer backups on the Steam Deck and adds the games to Stea
 
 ## Install
 
-```bash
-./install.sh
-```
+On the Steam Deck, in Desktop Mode:
 
-Then add the app to Steam (this restarts Steam):
+1. Download **GOG-Backup-Installer.desktop** from the [latest release](https://github.com/embergabor/deck-gog-installer/releases/latest).
+2. Open your Downloads folder and double-click it. If Desktop Mode asks whether to run it, allow it.
+3. Choose **Yes**. The app is installed, and Steam closes and reopens with **GOG Backup Installer** in your
+   library under Non-Steam.
 
-```bash
-ssh deck@steamdeck.local 'systemd-run --user --collect python3 ~/.local/share/gog-installer/gog_installer.py --apply-steam'
-```
+Switch back to Game Mode and start it from there. To update, run a newer installer the same way; your sources
+and installed games stay.
 
 ## Sources
 
